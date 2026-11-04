@@ -4,6 +4,9 @@
 #
 # Akai MPC Key 61 (Linux ARMv7, hard-float, NEON). Needs gcc-arm-linux-gnueabihf / g++-arm-linux-gnueabihf.
 # Usage: cmake -S . -B build-armv7 -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/armv7-linux-gnueabihf.cmake -DKICKEQ_BUILD_JUCE=OFF
+# The linear-phase mode (FFT convolution + design thread) is OFF by default for the MPC until the hardware benchmark shows
+# it fits (ARCHITECTURE.md section 4.7); a cache default, so -DKICKEQ_LINEAR_PHASE=ON on the command line wins.
+set(KICKEQ_LINEAR_PHASE OFF CACHE BOOL "Build the linear-phase mode (phase_mode parameter, FFT convolver, design thread)")
 set(CMAKE_SYSTEM_NAME Linux)
 set(CMAKE_SYSTEM_PROCESSOR armv7l)
 set(CMAKE_C_COMPILER   arm-linux-gnueabihf-gcc)

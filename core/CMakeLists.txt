@@ -24,6 +24,16 @@ add_library(kickeq_core STATIC
     src/state.cpp)
 add_library(kickeq::core ALIAS kickeq_core)
 
+# Linear-phase mode: kernel design, convolver and the design thread (the only part of the core that uses std::thread)
+if(KICKEQ_LINEAR_PHASE)
+    target_sources(kickeq_core PRIVATE src/linear_phase.cpp src/design_thread.cpp)
+    target_compile_definitions(kickeq_core PUBLIC KICKEQ_LINEAR_PHASE=1)
+    find_package(Threads REQUIRED)
+    target_link_libraries(kickeq_core PUBLIC Threads::Threads)
+else()
+    target_compile_definitions(kickeq_core PUBLIC KICKEQ_LINEAR_PHASE=0)
+endif()
+
 target_include_directories(kickeq_core PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
 target_compile_features(kickeq_core PUBLIC cxx_std_17)
 set_target_properties(kickeq_core PROPERTIES

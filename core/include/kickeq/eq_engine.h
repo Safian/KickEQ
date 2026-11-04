@@ -25,13 +25,26 @@
 // targets and the position at which they are handed over (block-size independence). A new target takes
 // effect at the start of the next 32-sample cell at the latest.
 //
-// The class contains all its memory (no heap, no locks, no syscalls anywhere); instances share no state.
+// The minimum-phase path contains all its memory (no heap, no locks, no syscalls anywhere); instances share no
+// state. With KICKEQ_LINEAR_PHASE the engine additionally owns one heap block (the linear-phase stage: convolver,
+// kernel mailbox, ~1.5 MB), allocated once in prepare () and never again: switching the phase mode on the audio
+// thread allocates nothing.
+//
+// Phase mode (ARCHITECTURE.md section 4.7): the mode comes with the parameters (phase_mode). Minimum keeps the
+// biquad cascade; Linear 2048 / 4096 / 8192 routes the audio through a partitioned FFT convolution with kernels
+// that a design thread computes from the same band parameters (see linear_phase.h, design_thread.h). The reported
+// latency is N / 2 samples, exactly, for every host block size. A change of the mode while running is bridged by
+// a 20 ms cross-fade between the two paths (the new path first warms up for its latency); the host is expected to
+// re-query the latency and restart, the engine just keeps sounding sensible meanwhile.
 
 #pragma once
 
+#include <atomic>
 #include <cstdint>
+#include <memory>
 
 #include "kickeq/biquad.h"
+#include "kickeq/linear_phase.h"
 #include "kickeq/params.h"
 
 namespace kickeq
@@ -106,6 +119,8 @@ struct BandState
     int fadeProgress = 0;  // samples elapsed in the running cross-fade
     bool fading = false;
 };
+
+struct LinearStage; // heap block of the linear-phase mode (eq_engine.cpp)
 } // namespace detail
 
 class EqEngine
@@ -115,10 +130,15 @@ public:
     static constexpr int segmentLength = 32;
 
     EqEngine() noexcept;
+    ~EqEngine();
+
+    EqEngine (const EqEngine&) = delete;
+    EqEngine& operator= (const EqEngine&) = delete;
 
     /** Sets the sample rate (clamped to >= 1 kHz) and resets everything. maxBlock is accepted for shell
-        symmetry; blocks of any size are processed. Not real-time safe in the sense that it may be slow, but
-        it does not allocate. */
+        symmetry; blocks of any size are processed. Not real-time safe in the sense that it may be slow; the first
+        call allocates the linear-phase stage when it is built in (never again afterwards). Stop a DesignThread
+        before calling it. */
     void prepare (double sampleRate, int maxBlock) noexcept;
 
     /** Clears all filter state and cross-fades. The next process() call snaps to its target (no ramp). */
@@ -134,7 +154,37 @@ public:
         process (target, data, nullptr, numSamples);
     }
 
-    int getLatencySamples() const noexcept { return 0; }
+    /** Latency in samples of the phase mode of the most recent target: 0 for minimum phase, N / 2 for linear
+        phase (1024 / 2048 / 4096). Any thread. */
+    int getLatencySamples() const noexcept { return latencyForMode (targetMode.load (std::memory_order_relaxed)); }
+
+    /** Latency of a phase_mode value in this build (0 when the linear-phase mode is not compiled in or not
+        allocated). Any thread; constant after prepare (). */
+    int latencyForMode (int mode) const noexcept;
+
+    /** True when the linear-phase mode can run (compiled in and its stage allocated). */
+    bool linearPhaseAvailable() const noexcept { return linear != nullptr; }
+
+    // ---- linear-phase design interface (nullptr / no-ops when linearPhaseAvailable () is false) ------------------
+
+    /** The mailbox pair between this engine and a design thread (DesignThread::start takes it). Valid for the life
+        of the engine; stop the design thread before prepare () or destruction. */
+    DesignLink* designLink() noexcept;
+
+    /** Posts a design request for `values` (single producer: the audio thread posts them itself while the linear
+        phase is active; call this from another thread only while no audio thread runs). */
+    void requestDesign (const ParamValues& values) noexcept;
+
+    /** Number of design requests posted so far (0 = none). Any thread. */
+    uint64_t paramSequence() const noexcept;
+
+    /** Sequence number of the request the kernels in use were designed from (0 = none yet). Any thread. */
+    uint64_t appliedKernelSequence() const noexcept;
+
+    /** Reference single-thread design for tests and offline rendering: posts the request, designs it on the calling
+        thread and publishes the kernels; the audio side picks them up at its next 128-sample block boundary.
+        Allocates the designer on first use; not for the audio thread, and not while a DesignThread runs. */
+    void designSynchronously (const ParamValues& values);
 
     /** Samples the output keeps ringing after the input stopped, for the current parameters
         (min (10 s, 13.8 Q / (pi f)) of the slowest enabled section, plus the fade times). 0 when bypassed. */
@@ -146,9 +196,15 @@ public:
     double getAutoGainDb() const noexcept { return autoGainDb; }
 
 private:
+    enum class Path : uint8_t { minimum, linear, minToLinear, linearToMin };
+
     void updateControl (const ParamValues& target) noexcept;
+    void updateControlMin (const ParamValues& target) noexcept;
     void snapBuild (const ParamValues& target) noexcept;
+    void buildBands (const ParamValues& target) noexcept;
+    void snapGains (const ParamValues& target) noexcept;
     void applyTargets (const ParamValues& target) noexcept;
+    void applyGainTargets (const ParamValues& target, bool dirty) noexcept;
     void retargetBand (detail::BandState& band, const BandParams& p, int slope) noexcept;
     void designNewest (detail::BandState& band) noexcept;
     void dropAll() noexcept;
@@ -156,7 +212,24 @@ private:
     void startBypassRamp (double to) noexcept;
     double bypassNow() const noexcept;
     void tick (uint64_t time) noexcept;
+    void tickBands (uint64_t time) noexcept;
+    void tickGains (uint64_t time) noexcept;
     void processSegment (float* left, float* right, int n, uint32_t gridPos) noexcept;
+    bool computeMinWet (const float* left, const float* right, int n, bool force) noexcept;
+    bool finishSegment (const double* dry0, const double* dry1, float* left, float* right, int n, uint32_t gridPos) noexcept;
+    void advanceMinFades (int n) noexcept;
+    void advanceBypass (int n) noexcept;
+
+    // linear-phase path (eq_engine.cpp, compiled with KICKEQ_LINEAR_PHASE)
+    void initLinear (const ParamValues& target, int mode) noexcept;
+    void beginMinToLinear (const ParamValues& target, int mode) noexcept;
+    void beginLinearToMin (const ParamValues& target) noexcept;
+    void updateControlLinear (const ParamValues& target) noexcept;
+    void postDesignRequest (const ParamValues& target) noexcept;
+    void requestDesignIfChanged (const ParamValues& target) noexcept;
+    void processSegmentMixed (float* left, float* right, int n, uint32_t gridPos) noexcept;
+    double pathWeight (int offset) const noexcept;
+    void finishTransition() noexcept;
     void applyBand (int bandIndex, Placement place, int lane, int n) noexcept;
     void updateTail (const ParamValues& target) noexcept;
 
@@ -185,7 +258,16 @@ private:
 
     uint32_t tailSamples = 0;
 
+    std::unique_ptr<detail::LinearStage> linear; // nullptr: linear phase unavailable
+    std::atomic<int> targetMode { 0 };           // phase mode of the most recent target (0 = minimum)
+    Path path = Path::minimum;
+    int stageMode = 0;    // mode the convolver runs while path != minimum
+    int mixPos = 0;       // samples since the start of the running path transition
+    int warmSamples = 0;  // minToLinear: the new path first runs this long (its latency) before the fade starts
+    ParamValues lastRequested;
+
     double work[2][segmentLength] = {};
+    double dryBuf[2][segmentLength] = {};
     double scratch[segmentLength] = {};
     double dryLane[segmentLength] = {};
     double fadeRamp[numBands][segmentLength] = {};

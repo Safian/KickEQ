@@ -48,6 +48,7 @@
 //     (CLAP_PROCESS_EVENTS_RESOLUTION_SAMPLES 64); refBlockJuce reproduces that rule for the reference engine.
 //
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <memory>
@@ -56,6 +57,7 @@
 #include <thread>
 
 #include "kickeq/clap_analyzer.h"
+#include "kickeq/eq_curve.h"
 #include "kickeq/eq_engine.h"
 #include "kickeq/presets.h"
 #include "kickeq/state.h"
@@ -388,10 +390,16 @@ void testParams (Ctx& c)
         const bool wantStepped = c.options.juce ? t.kind == Kind::Bool : t.kind != Kind::Float;
         const bool wantEnum = !c.options.juce && t.kind == Kind::Enum;
         const bool wantBypass = !c.options.juce && i == paramBypass;
-        flagsOk = flagsOk && (info.flags & CLAP_PARAM_IS_AUTOMATABLE) != 0 && stepped == wantStepped
+        // phase_mode changes the latency: not automatable; without the feature it is hidden and read-only
+        const bool wantAutomatable = (t.flags & flagAutomatable) != 0;
+        const bool unavailable = (t.flags & flagNeedsLinearPhase) != 0 && !linearPhaseOn();
+        flagsOk = flagsOk && ((info.flags & CLAP_PARAM_IS_AUTOMATABLE) != 0) == wantAutomatable && stepped == wantStepped
                   && ((info.flags & CLAP_PARAM_IS_ENUM) != 0) == wantEnum
                   && ((info.flags & CLAP_PARAM_IS_BYPASS) != 0) == wantBypass
-                  && (info.flags & (CLAP_PARAM_IS_HIDDEN | CLAP_PARAM_IS_READONLY)) == 0;
+                  // JUCE profile: the wrapper has no hidden / read-only flags; the JUCE shell keeps the parameter non-automatable
+                  // and pins its value to Minimum instead (the editor hides the box)
+                  && (c.options.juce || ((info.flags & CLAP_PARAM_IS_HIDDEN) != 0) == unavailable)
+                  && (c.options.juce || ((info.flags & CLAP_PARAM_IS_READONLY) != 0) == unavailable);
         if (!flagsOk && firstBad.empty())
             firstBad = fmt ("param %d (%s) flags 0x%x", i, t.strId, info.flags);
     }
@@ -409,12 +417,12 @@ void testParams (Ctx& c)
     check (namesOk, "names and module paths == core table, non-empty");
     check (rangesOk, "min / max == core table, finite");
     check (defaultsOk, "default values == core table, inside range");
-    check (flagsOk, "flags: automatable; stepped for bool+enum; enum; bypass only on bypass", firstBad);
+    check (flagsOk, "flags: automatable (not phase_mode); stepped for bool+enum; enum; bypass only on bypass; phase_mode hidden+read-only only without linear phase", firstBad);
     clap_param_info_t dummy {};
     check (!pe->get_info (p, static_cast<uint32_t> (numParams), &dummy), "get_info out of range fails");
     double out = 0;
     if (!c.options.juce) // the JUCE wrapper indexes its id map without checking
-        check (!pe->get_value (p, 0xDEAD, &out) && !pe->get_value (p, 3, &out), "get_value of an unknown / reserved id fails");
+        check (!pe->get_value (p, 0xDEAD, &out) && !pe->get_value (p, 4, &out), "get_value of an unknown / unused id fails");
 
     bool defOk = true;
     for (int i = 0; i < numParams; ++i)
@@ -427,6 +435,8 @@ void testParams (Ctx& c)
     for (int i = 0; i < numParams; ++i)
     {
         const ParamInfo& t = paramInfo (i);
+        if ((t.flags & flagNeedsLinearPhase) != 0 && !linearPhaseOn())
+            continue; // pinned to its default in this build: no round trip of other values
         std::vector<double> values;
         if (t.kind != Kind::Float)
             for (int v = static_cast<int> (t.min); v <= static_cast<int> (t.max); ++v)
@@ -469,18 +479,19 @@ void testParams (Ctx& c)
     for (int i = 0; i < numParams; ++i)
     {
         const ParamInfo& t = paramInfo (i);
+        // (a parameter the build does not have, phase_mode without linear phase, always reads its default)
         inst.setParam (t.id, t.max);
-        maxOk = maxOk && near (c, t.id, inst.value (t.id), static_cast<double> (t.max));
+        maxOk = maxOk && near (c, t.id, inst.value (t.id), static_cast<double> (clampParam (t, t.max)));
         inst.setParam (t.id, t.min);
-        minOk = minOk && near (c, t.id, inst.value (t.id), static_cast<double> (t.min));
+        minOk = minOk && near (c, t.id, inst.value (t.id), static_cast<double> (clampParam (t, t.min)));
         const double mid = t.min + 0.37 * (t.max - t.min);
         inst.setParam (t.id, mid);
         const float expect = clampParam (t, static_cast<float> (mid));
         midOk = midOk && near (c, t.id, inst.value (t.id), static_cast<double> (expect));
         inst.setParam (t.id, 1.0e300);
-        clampOk = clampOk && near (c, t.id, inst.value (t.id), static_cast<double> (t.max));
+        clampOk = clampOk && near (c, t.id, inst.value (t.id), static_cast<double> (clampParam (t, t.max)));
         inst.setParam (t.id, -1.0e300);
-        clampOk = clampOk && near (c, t.id, inst.value (t.id), static_cast<double> (t.min));
+        clampOk = clampOk && near (c, t.id, inst.value (t.id), static_cast<double> (clampParam (t, t.min)));
         inst.setParam (t.id, std::nan (""));
         nanOk = nanOk && near (c, t.id, inst.value (t.id), static_cast<double> (t.def));
     }
@@ -490,8 +501,8 @@ void testParams (Ctx& c)
     check (nanOk, "flush: NaN becomes the default");
 
     const auto before = inst.allValues();
-    inst.setParams ({ { 0, 0xDEAD, 1.0 }, { 0, 3, 1.0 } });
-    check (before == inst.allValues(), "flush: unknown and reserved ids are ignored");
+    inst.setParams ({ { 0, 0xDEAD, 1.0 }, { 0, 4, 1.0 } });
+    check (before == inst.allValues(), "flush: unknown and unused ids are ignored");
 
     // events of another event space, or of another type, are not parameter changes
     inst.setParam (paramInfo (paramOutGain).id, 0.0);
@@ -803,15 +814,17 @@ void testRemoteControls (Ctx& c)
         else
         {
             shapeOk = shapeOk && pg.param_ids[0] == paramInfo (paramBypass).id && pg.param_ids[1] == paramInfo (paramOutGain).id
-                      && pg.param_ids[2] == paramInfo (paramAutoGain).id;
+                      && pg.param_ids[2] == paramInfo (paramAutoGain).id
+                      && pg.param_ids[3] == (linearPhaseOn() ? paramInfo (paramPhaseMode).id : CLAP_INVALID_ID);
         }
     }
-    check (shapeOk, "pages: band pages hold on/type/freq/gain/q/place/slope, global page bypass/out_gain/auto_gain");
+    check (shapeOk, "pages: band pages hold on/type/freq/gain/q/place/slope, global page bypass/out_gain/auto_gain/phase_mode");
     check (namesOk, "pages have section and page names");
     check (pageIds.size() == n, "page ids are unique");
-    bool coverOk = seen.size() == static_cast<size_t> (numParams);
+    const size_t available = static_cast<size_t> (numParams) - (linearPhaseOn() ? 0u : 1u); // phase_mode is unavailable without linear phase
+    bool coverOk = seen.size() == available;
     for (int i = 0; i < numParams; ++i)
-        coverOk = coverOk && seen.count (paramInfo (i).id) == 1;
+        coverOk = coverOk && seen.count (paramInfo (i).id) == ((paramInfo (i).flags & flagNeedsLinearPhase) != 0 && !linearPhaseOn() ? 0u : 1u);
     check (coverOk, "the pages cover every parameter exactly once", fmt ("%zu entries", seen.size()));
     clap_remote_controls_page_t none {};
     check (!inst.remote->get (inst.plugin, n, &none), "page index out of range fails");
@@ -1185,9 +1198,22 @@ void testProcessBlocks (Ctx& c)
     }
 }
 
+/** Silence through the shell for ~1.5 s of wall time, so that the design thread has delivered its kernels (the output
+    is silent either way, so when exactly the audio side picks them up does not matter) before any signal comes. */
+constexpr int preludeBlocks = 60, preludeBlock = 256;
+void shellPrelude (Instance& inst)
+{
+    std::vector<float> zero (preludeBlock, 0.0f), out (preludeBlock);
+    for (int i = 0; i < preludeBlocks; ++i)
+    {
+        inst.process (zero.data(), zero.data(), out.data(), out.data(), preludeBlock);
+        std::this_thread::sleep_for (std::chrono::milliseconds (25));
+    }
+}
+
 void testBaseline (Ctx& c)
 {
-    section ("cross-shell baseline: fixed state + 5 s noise vs core EqEngine");
+    section ("cross-shell baseline: fixed state + 5 s noise vs core EqEngine (minimum phase and linear phase)");
     const std::vector<uint8_t> blob = baselineState();
     if (!c.options.dumpState.empty())
     {
@@ -1198,15 +1224,32 @@ void testBaseline (Ctx& c)
         }
     }
 
-    std::vector<float> dump;
-    for (const double rate : { 44100.0, 48000.0 })
+    struct Run
     {
+        double rate;
+        int mode;
+    };
+    // minimum phase at both rates, then linear phase 2048 at 44.1 kHz and 8192 at 48 kHz (without the feature the
+    // state's phase mode reads back as Minimum and the same runs repeat the minimum-phase comparison)
+    const Run runs[4] = { { 44100.0, 0 }, { 48000.0, 0 }, { 44100.0, 1 }, { 48000.0, 3 } };
+
+    std::vector<float> dump;
+    for (const Run& run : runs)
+    {
+        if (run.mode != 0 && c.options.noThreads && linearPhaseOn())
+        {
+            std::printf ("SKIP  linear phase baseline at %.0f Hz (--no-threads: the design thread cannot be created)\n", run.rate);
+            continue;
+        }
+        const double rate = run.rate;
+        const bool linearRun = run.mode != 0 && linearPhaseOn();
+        const std::vector<uint8_t> runBlob = baselineState (run.mode);
         const size_t n = static_cast<size_t> (rate * 5.0);
         const Stereo in = noiseStereo (n, 1234);
         Instance inst (c.host, c.factory);
+        const bool loaded = inst.loadState (runBlob); // before activation: the activation runs (and reports) the loaded phase mode
         inst.activate (rate, 1, 512);
-        const bool loaded = inst.loadState (blob);
-        if (rate == 48000.0 && !c.options.dumpSaved.empty())
+        if (rate == 48000.0 && run.mode == 0 && !c.options.dumpSaved.empty())
         {
             const std::vector<uint8_t> saved = inst.saveState();
             if (std::FILE* f = std::fopen (c.options.dumpSaved.c_str(), "wb"))
@@ -1219,17 +1262,33 @@ void testBaseline (Ctx& c)
                 check (false, "write --dump-saved file");
             }
         }
+        if (linearRun)
+            shellPrelude (inst);
         const Stereo out = shellRun (inst, in, { 512 }, false);
 
         ParamValues pv;
-        loadState (blob.data(), blob.size(), pv);
+        loadState (runBlob.data(), runBlob.size(), pv);
         Stereo want = in;
         auto ref = makeRef (rate);
+        if (linearRun)
+        {
+            // the kernels are designed in this thread before the same silent prelude
+            ref->designSynchronously (pv);
+            Stereo silence (preludeBlocks * preludeBlock);
+            for (int b = 0; b < preludeBlocks; ++b)
+                ref->process (pv, silence.l.data() + b * preludeBlock, silence.r.data() + b * preludeBlock, preludeBlock);
+        }
         ref->process (pv, want.l.data(), want.r.data(), static_cast<int> (n));
         size_t at = 0;
         const bool eq = bitEqual (out.l, want.l, &at) && bitEqual (out.r, want.r, &at);
-        check (loaded && eq && allFinite (out.l), rate == 44100.0 ? "44.1 kHz: shell output == core reference, bit-identical" : "48 kHz: shell output == core reference, bit-identical",
-               fmt ("first difference at %zu", at));
+        const char* name = run.mode == 0 ? (rate == 44100.0 ? "44.1 kHz: shell output == core reference, bit-identical"
+                                                            : "48 kHz: shell output == core reference, bit-identical")
+                                         : (rate == 44100.0 ? "44.1 kHz, linear phase 2048: shell output == core reference, bit-identical"
+                                                            : "48 kHz, linear phase 8192: shell output == core reference, bit-identical");
+        check (loaded && eq && allFinite (out.l), name, fmt ("first difference at %zu", at));
+        if (linearRun)
+            check (inst.latency->get (inst.plugin) == static_cast<uint32_t> (phaseModeLatency (run.mode)), "reports the latency N / 2",
+                   fmt ("%u", inst.latency->get (inst.plugin)));
         for (size_t i = 0; i < n; ++i)
         {
             dump.push_back (out.l[i]);
@@ -1243,7 +1302,7 @@ void testBaseline (Ctx& c)
         {
             std::fwrite (dump.data(), sizeof (float), dump.size(), f);
             std::fclose (f);
-            std::printf ("      wrote %zu interleaved float32 frames (44.1 kHz 5 s, then 48 kHz 5 s) to %s\n", dump.size() / 2, c.options.dumpOutput.c_str());
+            std::printf ("      wrote %zu interleaved float32 frames (5 s each: 44.1 kHz, 48 kHz, 44.1 kHz linear 2048, 48 kHz linear 8192) to %s\n", dump.size() / 2, c.options.dumpOutput.c_str());
         }
         else
         {
@@ -1292,6 +1351,183 @@ void testForeignState (Ctx& c)
     check (viaParams, "clap.params get_value reports the blob values");
     if (c.options.juce)
         check (ui.data != nullptr && ui.size >= 1, "the JUCE shell stores its editor state in the UI01 chunk");
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// Linear phase
+// ---------------------------------------------------------------------------------------------------------
+
+namespace
+{
+double lockInGainDb (const std::vector<float>& x, size_t from, size_t len, double omega, double inputAmp)
+{
+    double sr = 0.0, si = 0.0, sw = 0.0;
+    for (size_t i = 0; i < len; ++i)
+    {
+        const double w = 0.5 - 0.5 * std::cos (2.0 * 3.14159265358979323846 * (static_cast<double> (i) + 0.5) / static_cast<double> (len));
+        sr += w * x[from + i] * std::cos (omega * static_cast<double> (i + from));
+        si += w * x[from + i] * std::sin (omega * static_cast<double> (i + from));
+        sw += w;
+    }
+    return 20.0 * std::log10 (2.0 * std::sqrt (sr * sr + si * si) / sw / inputAmp);
+}
+
+/** True when out[i] == in[i - delay] (0 before) for every i, bit for bit. */
+bool isDelayedCopy (const Stereo& in, const Stereo& out, size_t delay)
+{
+    for (size_t i = 0; i < in.l.size(); ++i)
+    {
+        const float wl = i >= delay ? in.l[i - delay] : 0.0f, wr = i >= delay ? in.r[i - delay] : 0.0f;
+        if (out.l[i] != wl || out.r[i] != wr)
+            return false;
+    }
+    return true;
+}
+} // namespace
+
+void testLinearPhase (Ctx& c)
+{
+    section ("linear phase: latency, restart request, design thread");
+    const uint32_t phaseId = paramInfo (paramPhaseMode).id;
+
+    if (!linearPhaseOn())
+    {
+        Instance inst (c.host, c.factory);
+        inst.setParam (phaseId, 3.0);
+        check (inst.value (phaseId) == 0.0, "built without linear phase: phase_mode cannot leave Minimum");
+        inst.activate (48000.0, 1, 512);
+        check (inst.latency->get (inst.plugin) == 0, "built without linear phase: latency stays 0");
+        ParamValues v;
+        v.set (paramPhaseMode, 2.0f);
+        check (inst.loadState (blobFor (v)) && inst.value (phaseId) == 0.0, "built without linear phase: a state with a linear mode loads as Minimum");
+        return;
+    }
+
+    // ---- before activation: the latency follows the parameter, the host is told, no restart is needed ----------
+    Instance a (c.host, c.factory);
+    check (a.latency->get (a.plugin) == 0, "latency 0 in minimum phase");
+    c.host.latencyChanged = 0;
+    c.host.restartRequests = 0;
+    a.setParam (phaseId, 2.0);
+    a.pump(); // on_main_thread, as a host does after request_callback
+    check (a.latency->get (a.plugin) == 2048, "phase_mode Linear 4096 (before activation): latency 2048", fmt ("%u", a.latency->get (a.plugin)));
+    if (!c.options.juce)
+        // CLAP: latency.changed is only allowed inside activate; while deactivated there is nothing to restart
+        check (c.host.latencyChanged.load() == 0 && c.host.restartRequests.load() == 0, "mode change while deactivated: no host call at all", fmt ("changed %d restart %d", c.host.latencyChanged.load(), c.host.restartRequests.load()));
+
+    // ---- flat EQ in linear phase: output == input delayed by exactly N / 2, bit for bit ------------------------------
+    a.activate (48000.0, 1, 512);
+    // the latency of this activation differs from the previous one: latency.changed is called, inside activate (the
+    // JUCE wrapper does the same when the processor's latency changed)
+    check (c.host.latencyChanged.load() == 1, "latency.changed called once, inside activate", fmt ("%d", c.host.latencyChanged.load()));
+    const Stereo in = noiseStereo (20000, 55);
+    check (isDelayedCopy (in, shellRun (a, in, { 256, 100, 1024, 7, 33 }, false), 2048), "flat, Linear 4096: output == input delayed by 2048 samples (bit-identical)");
+    check (a.latency->get (a.plugin) == 2048, "latency 2048 while active");
+
+    // ---- mode change while active (event on the audio thread): flags only there, restart request from the main thread ----
+    c.host.latencyChanged = 0;
+    c.host.restartRequests = 0;
+    c.host.callbackRequests = 0;
+    {
+        Stereo out (2048), blk = noiseStereo (2048, 56);
+        a.process (blk.l.data(), blk.r.data(), out.l.data(), out.r.data(), 2048, { { 700, phaseId, 3.0 } });
+        check (allFinite (out.l) && allFinite (out.r), "mode change while processing: output stays finite");
+        if (!c.options.juce)
+        {
+            check (c.host.callbackRequests.load() == 1, "audio thread only asks for a main thread callback", fmt ("%d", c.host.callbackRequests.load()));
+            check (c.host.restartRequests.load() == 0 && c.host.latencyChanged.load() == 0, "nothing is called on the host from the audio thread", fmt ("restart %d changed %d", c.host.restartRequests.load(), c.host.latencyChanged.load()));
+        }
+        a.pump();
+        if (c.options.juce) // the wrapper requests the restart itself (latency change of the processor)
+        {
+            check (c.host.restartRequests.load() >= 1, "JUCE: request_restart after the latency changed", fmt ("restart %d", c.host.restartRequests.load()));
+            check (a.latency->get (a.plugin) == 4096, "latency 4096 after the change");
+        }
+        else
+        {
+            check (c.host.restartRequests.load() == 1 && c.host.latencyChanged.load() == 0, "on_main_thread: request_restart (latency.changed only inside activate)", fmt ("changed %d restart %d", c.host.latencyChanged.load(), c.host.restartRequests.load()));
+            check (a.latency->get (a.plugin) == 2048, "while activated clap.latency keeps reporting the running configuration (2048)", fmt ("%u", a.latency->get (a.plugin)));
+            a.pump();
+            check (c.host.restartRequests.load() == 1, "a second callback does not repeat the request");
+        }
+    }
+
+    // ---- the host restarts the plugin: the new latency is in effect ----------------------------------------------------
+    c.host.latencyChanged = 0;
+    a.deactivate();
+    a.activate (48000.0, 1, 512);
+    check (c.host.latencyChanged.load() == 1, "restart: latency.changed inside activate", fmt ("%d", c.host.latencyChanged.load()));
+    check (a.latency->get (a.plugin) == 4096, "restart: latency 4096");
+    check (isDelayedCopy (in, shellRun (a, in, { 480 }, false), 4096), "after the restart: output == input delayed by 4096 samples (bit-identical)");
+
+    // ---- state load: a different mode asks for a restart, the same mode does not -------------------------------------------
+    c.host.latencyChanged = 0;
+    c.host.restartRequests = 0;
+    ParamValues minimum;
+    check (a.loadState (blobFor (minimum)), "load a Minimum state while active");
+    if (c.options.juce)
+    {
+        a.pump();
+        check (c.host.restartRequests.load() >= 1, "JUCE: state load with another phase mode: request_restart", fmt ("restart %d", c.host.restartRequests.load()));
+        check (a.latency->get (a.plugin) == 0, "latency 0 again");
+    }
+    else
+    {
+        check (c.host.latencyChanged.load() == 0 && c.host.restartRequests.load() == 1, "state load with another phase mode: request_restart (no latency.changed outside activate)", fmt ("changed %d restart %d", c.host.latencyChanged.load(), c.host.restartRequests.load()));
+        check (a.latency->get (a.plugin) == 4096, "still reporting the running configuration until the restart");
+    }
+    {
+        Stereo out = shellRun (a, in, { 300 }, false); // the engine cross-fades to the minimum-phase path meanwhile
+        check (allFinite (out.l) && allFinite (out.r), "finite output while the engine follows the mode change");
+    }
+    a.deactivate();
+    a.activate (48000.0, 1, 512);
+    check (a.latency->get (a.plugin) == 0, "after the restart: latency 0");
+    check (isDelayedCopy (in, shellRun (a, in, { 480 }, false), 0), "after the restart in Minimum: bit-transparent, no latency");
+    c.host.latencyChanged = 0;
+    c.host.restartRequests = 0;
+    check (a.loadState (blobFor (minimum)), "load the same state again");
+    a.pump();
+    check (c.host.restartRequests.load() == 0 && c.host.latencyChanged.load() == 0, "same mode: no latency change, no restart");
+
+    // ---- presets keep the phase mode -----------------------------------------------------------------------------------------
+    if (a.presetLoad != nullptr) // (the JUCE shell has no preset-load extension: its programs are tested by kickeq_juce_shell_test)
+    {
+        a.setParam (phaseId, 1.0);
+        a.pump();
+        a.presetLoad->from_location (a.plugin, CLAP_PRESET_DISCOVERY_LOCATION_PLUGIN, nullptr, "Kick Punch");
+        check (a.value (phaseId) == 1.0 && a.value (idOf (1, BandParam::on)) == 1.0, "a preset recall keeps the phase mode");
+    }
+
+    // ---- a real filter through the real design thread ---------------------------------------------------------------------------
+    for (const int mode : { 1, 3 })
+    {
+        ParamValues v;
+        v.set (paramPhaseMode, static_cast<float> (mode));
+        v.set (3, BandParam::on, 1.0f);
+        v.set (3, BandParam::type, 0.0f);
+        v.set (3, BandParam::freq, 1000.0f);
+        v.set (3, BandParam::gain, 9.0f);
+        v.set (3, BandParam::q, 1.0f);
+        Instance b (c.host, c.factory);
+        b.loadState (blobFor (v));
+        b.activate (48000.0, 1, 512);
+        check (b.latency->get (b.plugin) == static_cast<uint32_t> (phaseModeLatency (mode)), "latency of the loaded state");
+        shellPrelude (b);
+
+        const size_t n = static_cast<size_t> (phaseModeLength (mode)) + 24000;
+        Stereo tone (n), out (n);
+        for (size_t i = 0; i < n; ++i)
+            tone.l[i] = tone.r[i] = static_cast<float> (0.5 * std::sin (2.0 * 3.14159265358979323846 * 1000.0 * static_cast<double> (i) / 48000.0));
+        out = shellRun (b, tone, { 480 }, false);
+        const double gain = lockInGainDb (out.l, static_cast<size_t> (phaseModeLength (mode)) + 2000, 20000, 2.0 * 3.14159265358979323846 * 1000.0 / 48000.0, 0.5);
+        float freq = 1000.0f, mag = 0.0f;
+        computeResponse (v, 48000.0, &freq, &mag, nullptr, 1, ChannelView::stereo);
+        check (std::fabs (gain - mag) < 0.05, mode == 1 ? "Linear 2048 through the design thread: +9 dB bell at 1 kHz within 0.05 dB"
+                                                         : "Linear 8192 through the design thread: +9 dB bell at 1 kHz within 0.05 dB",
+               fmt ("%.3f dB vs %.3f dB", gain, mag));
+        check (bitEqual (out.l, out.r), "both channels identical");
+    }
 }
 
 void testAnalyzer (Ctx& c)
@@ -1479,6 +1715,15 @@ int runConformance (Loader& loader, const Options& options)
         testParams (c);
         testState (c);
         testLatencyTail (c);
+        if (options.noThreads && linearPhaseOn())
+        {
+            section ("linear phase: latency, restart request, design thread");
+            std::printf ("SKIP  linear phase (--no-threads: the design thread cannot be created)\n");
+        }
+        else
+        {
+            testLinearPhase (c);
+        }
         testPorts (c);
         if (!options.juce) // JUCE shell: no remote controls, preset discovery or analyser vendor extension
         {

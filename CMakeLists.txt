@@ -30,6 +30,12 @@ option(KICKEQ_BUILD_TESTS "Build and register the kickeq_core unit tests" ON)
 option(KICKEQ_SANITIZE    "Build kickeq_core and its tests with AddressSanitizer + UndefinedBehaviorSanitizer" OFF)
 
 project(KickEQ VERSION 0.1.0 LANGUAGES CXX)
+
+# Linear-phase mode (ARCHITECTURE.md section 4.7): partitioned FFT convolution + kernel design thread. When OFF the code is
+# not compiled into the engine, phase_mode stays in the parameter table but is reported hidden + read-only and forced
+# to Minimum. The ARMv7 (MPC) toolchain file gives it a cache default of OFF until the MPC benchmark exists (it can only do
+# that for an option declared after project(), which loads the toolchain file); pass -DKICKEQ_LINEAR_PHASE=ON to build it there.
+option(KICKEQ_LINEAR_PHASE "Build the linear-phase mode (phase_mode parameter, FFT convolver, design thread)" ON)
 if(KICKEQ_BUILD_JUCE)
     enable_language(C)
 endif()
@@ -134,6 +140,7 @@ if(KICKEQ_BUILD_JUCE)
     target_compile_definitions(kickeq_juce_shell PUBLIC
         JUCE_WEB_BROWSER=0
         JUCE_USE_CURL=0
+        KICKEQ_LINEAR_PHASE=$<BOOL:${KICKEQ_LINEAR_PHASE}>
         PRIVATE
         KICKEQ_VERSION_STRING="${PROJECT_VERSION}")
     target_link_libraries(kickeq_juce_shell

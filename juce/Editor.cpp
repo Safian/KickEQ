@@ -87,6 +87,19 @@ KickEQEditor::KickEQEditor (KickEQProcessor& p)
         canvas.setView (static_cast<kickeq::ChannelView> (juce::jmax (0, viewBox.getSelectedId() - 1)));
     };
 
+    // ---- phase mode (a parameter, not editor state): the latency in ms is shown next to the box ------------------
+    if (kickeq::linearPhaseOn())
+    {
+        const kickeq::ParamInfo& info = kickeq::paramInfo (kickeq::paramPhaseMode);
+        for (int i = 0; i < info.numEnumLabels; ++i)
+            phaseBox.addItem (info.enumLabels[i], i + 1);
+        phaseBox.setTitle ("Phase mode");
+        phaseBox.setTooltip ("Minimum phase (no latency) or linear phase (FIR of 2048 / 4096 / 8192 taps, latency of half the length)");
+        phaseBox.setScrollWheelEnabled (false);
+        addAndMakeVisible (phaseBox);
+        phaseAttachment = std::make_unique<juce::ComboBoxParameterAttachment> (p.getCoreParameter (kickeq::paramPhaseMode), phaseBox);
+    }
+
     // ---- canvas and band strip ------------------------------------------------------------------------------------
     addAndMakeVisible (canvas);
     addAndMakeVisible (bandPanel);
@@ -139,6 +152,16 @@ void KickEQEditor::syncControlsFromProcessor()
     {
         shownPreset = preset;
         presetBox.setSelectedId (preset >= 0 ? preset + 1 : 0, juce::dontSendNotification);
+    }
+
+    // the latency next to the phase box follows the mode and the sample rate
+    const int latency = kickProcessor.getLatencyForMode (kickProcessor.getPhaseMode());
+    const double rate = kickProcessor.getDisplaySampleRate();
+    if (latency != shownLatencySamples || !juce::exactlyEqual (rate, shownRate))
+    {
+        shownLatencySamples = latency;
+        shownRate = rate;
+        repaint (latencyCaption.getSmallestIntegerContainer());
     }
 }
 
@@ -205,6 +228,14 @@ void KickEQEditor::paint (juce::Graphics& g)
     g.drawText ("Slope", slopeCaption, juce::Justification::centredRight, false);
     g.drawText ("Curve", curveCaption, juce::Justification::centredRight, false);
     g.drawText ("View", viewCaption, juce::Justification::centredRight, false);
+
+    if (kickeq::linearPhaseOn())
+    {
+        const double ms = 1000.0 * static_cast<double> (shownLatencySamples) / (shownRate > 0.0 ? shownRate : 48000.0);
+        g.setColour (shownLatencySamples > 0 ? colours::text : colours::textFaint);
+        g.drawText ((ms < 9.95 ? juce::String (ms, 1) : juce::String (juce::roundToInt (ms))) + " ms", latencyCaption,
+                    juce::Justification::centredLeft, false);
+    }
 }
 
 void KickEQEditor::resized()
@@ -229,23 +260,31 @@ void KickEQEditor::resized()
     h.removeFromRight (14);
     presetBox.setBounds (h.removeFromRight (juce::jmin (210, juce::jmax (120, h.getWidth() - 160))));
 
-    // toolbar: analyser controls on the left, curve controls on the right
+    // toolbar: analyser controls on the left, phase mode and curve controls on the right (all of it fits 720 px)
     auto t = toolbarArea.reduced (10, 3);
-    analyserCaption = t.removeFromLeft (52).toFloat();
+    analyserCaption = t.removeFromLeft (48).toFloat();
     t.removeFromLeft (6);
-    sourceBox.setBounds (t.removeFromLeft (76));
+    sourceBox.setBounds (t.removeFromLeft (64));
     t.removeFromLeft (6);
-    rangeBox.setBounds (t.removeFromLeft (84));
+    rangeBox.setBounds (t.removeFromLeft (74));
     t.removeFromLeft (6);
-    slopeCaption = t.removeFromLeft (38).toFloat();
+    slopeCaption = t.removeFromLeft (34).toFloat();
     t.removeFromLeft (6);
-    slopeBox.setBounds (t.removeFromLeft (94));
+    slopeBox.setBounds (t.removeFromLeft (82));
 
-    viewBox.setBounds (t.removeFromRight (84));
+    viewBox.setBounds (t.removeFromRight (70));
     t.removeFromRight (6);
-    viewCaption = t.removeFromRight (36).toFloat();
-    t.removeFromRight (10);
-    curveRangeBox.setBounds (t.removeFromRight (84));
+    viewCaption = t.removeFromRight (32).toFloat();
+    t.removeFromRight (8);
+    curveRangeBox.setBounds (t.removeFromRight (74));
     t.removeFromRight (6);
-    curveCaption = t.removeFromRight (38).toFloat();
+    curveCaption = t.removeFromRight (34).toFloat();
+
+    if (kickeq::linearPhaseOn())
+    {
+        t.removeFromRight (8);
+        latencyCaption = t.removeFromRight (40).toFloat();
+        t.removeFromRight (4);
+        phaseBox.setBounds (t.removeFromRight (88));
+    }
 }

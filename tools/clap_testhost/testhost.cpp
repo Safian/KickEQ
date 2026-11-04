@@ -288,7 +288,7 @@ const void* CLAP_ABI hostGetExtension (const clap_host_t* h, const char* id)
     return nullptr;
 }
 
-void CLAP_ABI hostRequestRestart (const clap_host_t*) {}
+void CLAP_ABI hostRequestRestart (const clap_host_t* h) { ++hostOf (h).restartRequests; }
 void CLAP_ABI hostRequestProcess (const clap_host_t*) {}
 void CLAP_ABI hostRequestCallback (const clap_host_t* h) { ++hostOf (h).callbackRequests; }
 } // namespace
@@ -644,10 +644,11 @@ bool allFinite (const std::vector<float>& a)
     return true;
 }
 
-std::vector<uint8_t> baselineState()
+std::vector<uint8_t> baselineState (int phaseMode)
 {
     using namespace kickeq;
     ParamValues v;
+    v.set (paramPhaseMode, static_cast<float> (phaseMode));
     const auto band = [&v] (int b, BandType t, float f, float g, float q, Placement p, int slope) {
         v.set (b, BandParam::on, 1.0f);
         v.set (b, BandParam::type, static_cast<float> (t));

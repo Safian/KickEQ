@@ -21,7 +21,7 @@
 // Shells and UIs only iterate this table; plain values are stored in a ParamValues.
 //
 // Parameter index (position in the table / in ParamValues) is NOT the stable id: persistent identity is
-// ParamInfo::id (CLAP param id) / ParamInfo::strId. id 3 (phase_mode) is reserved and absent for now.
+// ParamInfo::id (CLAP param id) / ParamInfo::strId. Table index == id for the four global parameters.
 
 #pragma once
 
@@ -30,6 +30,7 @@
 #include <cstdint>
 
 #include "kickeq/biquad.h"
+#include "kickeq/config.h"
 
 namespace kickeq
 {
@@ -42,6 +43,15 @@ enum class Scale : uint8_t { Linear, Log, Db };
 inline constexpr uint32_t flagAutomatable = 1u << 0;
 inline constexpr uint32_t flagStepped = 1u << 1;
 inline constexpr uint32_t flagHiddenInSimpleView = 1u << 2;
+/** The parameter only exists when the core is built with KICKEQ_LINEAR_PHASE: otherwise its value is forced to the
+    default and shells report it hidden and read-only. */
+inline constexpr uint32_t flagNeedsLinearPhase = 1u << 3;
+
+/** True when this build of the core can run the linear-phase mode (CMake option KICKEQ_LINEAR_PHASE). */
+inline constexpr bool linearPhaseEnabled = KICKEQ_LINEAR_PHASE != 0;
+/** The same as a plain function, for conditions: `if (linearPhaseOn ())` does not trigger the "conditional expression
+    is constant" warning (MSVC C4127) that the constexpr variable would in a build with -Werror. */
+inline bool linearPhaseOn() noexcept { return linearPhaseEnabled; }
 
 struct ParamInfo
 {
@@ -62,12 +72,26 @@ enum class Placement : int { stereo, left, right, mid, side };
 constexpr int numPlacements = 5;
 
 constexpr int numBands = 8;
-constexpr int numGlobalParams = 3;
+constexpr int numGlobalParams = 4;
 constexpr int paramsPerBand = 7;
-constexpr int numParams = numGlobalParams + numBands * paramsPerBand; // 59
+constexpr int numParams = numGlobalParams + numBands * paramsPerBand; // 60
 
 /** Table indices of the global parameters. */
-enum GlobalParam : int { paramBypass = 0, paramOutGain = 1, paramAutoGain = 2 };
+enum GlobalParam : int { paramBypass = 0, paramOutGain = 1, paramAutoGain = 2, paramPhaseMode = 3 };
+
+/** Values of the phase_mode parameter: minimum phase (biquad cascade, zero latency) or linear phase with an FIR of
+    N = 2048 / 4096 / 8192 taps and a latency of exactly N / 2 samples (ARCHITECTURE.md section 4.7). */
+enum class PhaseMode : int { minimum, linear2048, linear4096, linear8192 };
+constexpr int numPhaseModes = 4;
+
+/** FIR length N of a phase_mode value (0 for minimum phase; out-of-range values count as minimum). */
+constexpr int phaseModeLength (int mode) noexcept
+{
+    return mode == 1 ? 2048 : (mode == 2 ? 4096 : (mode == 3 ? 8192 : 0));
+}
+
+/** Latency in samples of a phase_mode value: N / 2 (0 for minimum phase). */
+constexpr int phaseModeLatency (int mode) noexcept { return phaseModeLength (mode) / 2; }
 
 /** Offset of a band parameter inside a band (k of the id scheme 0x100 + 0x10 * band + k). */
 enum class BandParam : int { on, type, freq, gain, q, place, slope };
@@ -92,6 +116,8 @@ inline constexpr const char* const bandTypeLabels[numBandTypes] =
 inline constexpr const char* const placementLabels[numPlacements] = { "Stereo", "Left", "Right", "Mid", "Side" };
 inline constexpr const char* const slopeLabels[numSlopes] =
     { "6 dB/oct", "12 dB/oct", "18 dB/oct", "24 dB/oct", "36 dB/oct", "48 dB/oct" };
+inline constexpr const char* const phaseModeLabels[numPhaseModes] =
+    { "Minimum", "Linear 2048", "Linear 4096", "Linear 8192" };
 
 namespace detail
 {
@@ -153,6 +179,10 @@ constexpr std::array<ParamInfo, numParams> makeParamTable() noexcept
                                  "dB", nullptr, 0, flagAutomatable);
     t[paramAutoGain] = makeInfo (2, "auto_gain", "Auto Gain", "Global", Kind::Bool, Scale::Linear, 0.0f, 1.0f, 0.0f, "",
                                  boolLabels, 2, flagAutomatable | flagStepped);
+    // Not automatable on purpose: it changes the reported latency (hosts must restart / re-query it).
+    t[paramPhaseMode] = makeInfo (3, "phase_mode", "Phase Mode", "Global", Kind::Enum, Scale::Linear, 0.0f,
+                                  static_cast<float> (numPhaseModes - 1), 0.0f, "", phaseModeLabels, numPhaseModes,
+                                  flagStepped | flagNeedsLinearPhase);
 
     for (int b = 0; b < numBands; ++b)
     {
@@ -205,6 +235,8 @@ constexpr const ParamInfo& paramInfo (int index) noexcept { return paramTable[st
     rounded to the nearest integer. */
 inline float clampParam (const ParamInfo& info, float v) noexcept
 {
+    if ((info.flags & flagNeedsLinearPhase) != 0 && !linearPhaseOn())
+        return info.def; // not available in this build: always the default (minimum phase)
     if (!(v == v))
         return info.def;
     v = v < info.min ? info.min : (v > info.max ? info.max : v);
@@ -279,6 +311,8 @@ struct ParamValues
     bool bypass() const noexcept { return get (paramBypass) >= 0.5f; }
     float outGainDb() const noexcept { return get (paramOutGain); }
     bool autoGain() const noexcept { return get (paramAutoGain) >= 0.5f; }
+    /** 0 = minimum phase, 1..3 = linear phase 2048 / 4096 / 8192 (see PhaseMode). */
+    int phaseMode() const noexcept { return static_cast<int> (get (paramPhaseMode)); }
 
     BandParams band (int b) const noexcept
     {

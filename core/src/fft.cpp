@@ -62,18 +62,10 @@ bool RealFft::init (int size)
     return true;
 }
 
-void RealFft::forward (const float* in, float* re, float* im) noexcept
+void RealFft::complexTransform() noexcept
 {
     float* const zr = zRe.data();
     float* const zi = zIm.data();
-
-    // pack even / odd samples as one complex sequence (bit reversed for the in-place transform)
-    for (int i = 0; i < m; ++i)
-    {
-        const int j = bitReverse[static_cast<size_t> (i)];
-        zr[j] = in[2 * i];
-        zi[j] = in[2 * i + 1];
-    }
 
     // radix-2 decimation in time; W_len^j = W_n^{j n / len}
     for (int len = 2; len <= m; len <<= 1)
@@ -94,6 +86,22 @@ void RealFft::forward (const float* in, float* re, float* im) noexcept
                 zi[a] += ti;
             }
     }
+}
+
+void RealFft::forward (const float* in, float* re, float* im) noexcept
+{
+    float* const zr = zRe.data();
+    float* const zi = zIm.data();
+
+    // pack even / odd samples as one complex sequence (bit reversed for the in-place transform)
+    for (int i = 0; i < m; ++i)
+    {
+        const int j = bitReverse[static_cast<size_t> (i)];
+        zr[j] = in[2 * i];
+        zi[j] = in[2 * i + 1];
+    }
+
+    complexTransform();
 
     // split: X[k] = E[k] + W_n^k O[k] with E = (Z[k] + conj Z[m-k]) / 2, O = (Z[k] - conj Z[m-k]) / (2 i)
     for (int k = 0; k <= m; ++k)
@@ -110,6 +118,42 @@ void RealFft::forward (const float* in, float* re, float* im) noexcept
         const float wr = twRe[static_cast<size_t> (k)], wi = twIm[static_cast<size_t> (k)];
         re[k] = er + (orr * wr - oi * wi);
         im[k] = ei + (orr * wi + oi * wr);
+    }
+}
+
+void RealFft::inverse (const float* re, const float* im, float* out) noexcept
+{
+    float* const zr = zRe.data();
+    float* const zi = zIm.data();
+
+    // Z[k] = E[k] + i O[k] with E[k] = (X[k] + X[k+m]) / 2, O[k] = (X[k] - X[k+m]) W_n^-k / 2 and, for a real
+    // signal, X[k+m] = conj X[m-k]. The sequence z = IDFT_m (Z) holds the even samples in its real and the odd
+    // samples in its imaginary part. IDFT_m (Z) = conj (DFT_m (conj Z)) / m: conj Z goes in bit reversed order into
+    // the forward transform.
+    for (int k = 0; k < m; ++k)
+    {
+        const float ar = re[k], ai = im[k];
+        const float br = re[m - k], bi = -im[m - k]; // X[k+m] = conj X[m-k]
+        const float er = 0.5f * (ar + br), ei = 0.5f * (ai + bi);
+        const float dr = 0.5f * (ar - br), di = 0.5f * (ai - bi);
+
+        const float wr = twRe[static_cast<size_t> (k)], wi = -twIm[static_cast<size_t> (k)]; // W^-k
+        const float orr = dr * wr - di * wi, oi = dr * wi + di * wr;
+
+        // Z = E + i O
+        const float zre = er - oi, zim = ei + orr;
+        const int j = bitReverse[static_cast<size_t> (k)];
+        zr[j] = zre;
+        zi[j] = -zim; // conj
+    }
+
+    complexTransform();
+
+    const float scale = 1.0f / static_cast<float> (m);
+    for (int j = 0; j < m; ++j)
+    {
+        out[2 * j] = zr[j] * scale;
+        out[2 * j + 1] = -zi[j] * scale;
     }
 }
 } // namespace kickeq

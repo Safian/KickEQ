@@ -104,10 +104,10 @@ TEST (state_round_trip_is_exact)
     // defaults round trip as well, and the layout is the documented one
     const ParamValues defaults;
     const auto blob = save (defaults);
-    CHECK (blob.size() == 12u + 59u * 8u + 4u);
+    CHECK (blob.size() == 12u + 60u * 8u + 4u);
     CHECK (std::memcmp (blob.data(), "KEQS", 4) == 0);
     CHECK (blob[4] == 1 && blob[5] == 0 && blob[6] == 0 && blob[7] == 0);   // version 1, little endian
-    CHECK (blob[8] == 59 && blob[9] == 0);                                  // numParams
+    CHECK (blob[8] == 60 && blob[9] == 0);                                  // numParams
     CHECK (blob[12] == 0 && blob[13] == 0);                                 // first id: 0 (bypass)
     CHECK (blob[blob.size() - 4] == 0 && blob[blob.size() - 1] == 0);       // no chunks
 }
@@ -145,7 +145,7 @@ TEST (state_save_size_query_and_small_buffer)
 {
     const ParamValues pv;
     const size_t need = saveState (pv, nullptr, 0);
-    CHECK (need == 12u + 59u * 8u + 4u);
+    CHECK (need == 12u + 60u * 8u + 4u);
 
     std::vector<uint8_t> small (need - 1, 0xAB);
     CHECK (saveState (pv, small.data(), small.size()) == need);
@@ -337,4 +337,48 @@ TEST (state_fuzzed_blobs_never_misbehave)
 
     CHECK (accepted > 100);
     CHECK (rejected > 100);
+}
+
+TEST (state_older_blobs_without_phase_mode_load_as_minimum)
+{
+    // a blob written before phase_mode existed: 59 entries, no id 3
+    std::vector<uint8_t> blob = header (1, static_cast<uint32_t> (numParams - 1));
+    for (int i = 0; i < numParams; ++i)
+    {
+        if (i == paramPhaseMode)
+            continue;
+        putU32 (blob, paramInfo (i).id);
+        putF32 (blob, i == paramOutGain ? -6.0f : paramInfo (i).def);
+    }
+    putU32 (blob, 0); // no chunks
+
+    ParamValues pv;
+    pv.set (paramPhaseMode, 2.0f); // loading starts from the defaults: Minimum again
+    CHECK (loadState (blob.data(), blob.size(), pv));
+    CHECK (pv.get (paramPhaseMode) == 0.0f && pv.phaseMode() == 0);
+    CHECK (pv.outGainDb() == -6.0f);
+}
+
+TEST (state_phase_mode_round_trips)
+{
+    for (int mode = 0; mode < numPhaseModes; ++mode)
+    {
+        ParamValues in;
+        in.set (paramPhaseMode, static_cast<float> (mode));
+        const auto blob = save (in);
+        ParamValues out;
+        CHECK (loadState (blob.data(), blob.size(), out));
+        // a build without the linear-phase mode stores and loads Minimum only
+        CHECK (out.phaseMode() == (linearPhaseOn() ? mode : 0));
+        CHECK (out == in);
+    }
+
+    // out-of-range stored values are clamped, not rejected
+    std::vector<uint8_t> blob = header (1, 1);
+    putU32 (blob, 3);
+    putF32 (blob, 17.0f);
+    putU32 (blob, 0);
+    ParamValues pv;
+    CHECK (loadState (blob.data(), blob.size(), pv));
+    CHECK (pv.phaseMode() == (linearPhaseOn() ? 3 : 0));
 }

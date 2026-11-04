@@ -24,6 +24,7 @@ add_executable(kickeq_core_tests
     test_blocksize.cpp
     test_extremes.cpp
     test_fft.cpp
+    test_linear_phase.cpp
     test_null.cpp
     test_params.cpp
     test_presets.cpp
@@ -41,3 +42,20 @@ endif()
 
 add_test(NAME kickeq_core_tests COMMAND kickeq_core_tests)
 set_tests_properties(kickeq_core_tests PROPERTIES TIMEOUT 1200)
+
+# Linear-phase mode: heap-free audio side (global operator new counting) and the threaded hand-over (also run under
+# ThreadSanitizer by hand: cmake -DCMAKE_CXX_FLAGS=-fsanitize=thread)
+if(KICKEQ_LINEAR_PHASE)
+    foreach(t kickeq_linear_alloc_test kickeq_linear_thread_test)
+        string(REPLACE "kickeq_linear_" "" src ${t})
+        add_executable(${t} ${src}.cpp)
+        target_link_libraries(${t} PRIVATE kickeq_core Threads::Threads)
+        if(MSVC)
+            target_compile_options(${t} PRIVATE /W4 /WX)
+        else()
+            target_compile_options(${t} PRIVATE -Wall -Wextra -Wpedantic -Werror -ffp-contract=off)
+        endif()
+        add_test(NAME ${t} COMMAND ${t})
+        set_tests_properties(${t} PROPERTIES TIMEOUT 600)
+    endforeach()
+endif()

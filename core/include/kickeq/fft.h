@@ -45,7 +45,14 @@ public:
         in, re and im must not alias each other. */
     void forward (const float* in, float* re, float* im) noexcept;
 
+    /** Inverse of forward(): n / 2 + 1 complex bins into n real samples, scaled by 1 / n so that
+        inverse (forward (x)) == x. The imaginary parts of bin 0 and bin n / 2 are ignored (zero for real signals).
+        re / im and out must not alias. */
+    void inverse (const float* re, const float* im, float* out) noexcept;
+
 private:
+    void complexTransform() noexcept; // in place on zRe / zIm, input in bit reversed order
+
     int n = 0;
     int m = 0; // n / 2, size of the complex transform
     std::vector<float> twRe, twIm; // e^{-2 pi i k / n}, k = 0 .. n / 2

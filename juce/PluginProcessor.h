@@ -24,18 +24,26 @@
 #include <array>
 #include <atomic>
 #include <memory>
+#include <mutex>
 
 #include "CoreParameter.h"
 #include "EditorSettings.h"
 #include "kickeq/analyzer.h"
+#include "kickeq/config.h"
 #include "kickeq/eq_engine.h"
 #include "kickeq/params.h"
 #include "kickeq/presets.h"
 #include "kickeq/state.h"
 
+#if KICKEQ_LINEAR_PHASE
+#include "kickeq/design_thread.h"
+#endif
+
 /** The JUCE shell of KickEQ: maps the JUCE plugin API onto kickeq::EqEngine, kickeq::paramTable, the core state
     blob and the core spectrum analyser (ARCHITECTURE.md sections 2.1, 3, 6, 8). */
-class KickEQProcessor final : public juce::AudioProcessor
+class KickEQProcessor final : public juce::AudioProcessor,
+                              private juce::AsyncUpdater,
+                              private juce::AudioProcessorParameter::Listener
 {
 public:
     KickEQProcessor();
@@ -43,7 +51,7 @@ public:
 
     // ---- juce::AudioProcessor ----------------------------------------------------------------------------------
     void prepareToPlay (double sampleRate, int samplesPerBlock) override;
-    void releaseResources() override {}
+    void releaseResources() override;
     void reset() override { engine->reset(); }
     bool isBusesLayoutSupported (const BusesLayout& layouts) const override;
     void processBlock (juce::AudioBuffer<float>&, juce::MidiBuffer&) override;
@@ -99,13 +107,33 @@ public:
     /** Sample rate for display purposes (48 kHz before the first prepareToPlay). */
     double getDisplaySampleRate() const noexcept;
 
+    /** The phase mode parameter as an index (0 = minimum, 1..3 = linear 2048 / 4096 / 8192). Any thread. */
+    int getPhaseMode() const noexcept;
+    /** Latency in samples of a phase mode at the current sample rate setting (what getLatencySamples () reports once
+        the mode has been applied). */
+    int getLatencyForMode (int mode) const noexcept;
+
 private:
     void setEditorSettingsInternal (const kickeq::ui::EditorSettings& settings) noexcept;
+
+    // phase mode: the parameter listener raises an async update, which (message thread) tells the host about the new
+    // latency (AudioProcessor::setLatencySamples -> updateHostDisplay) and wakes / parks the design thread
+    void parameterValueChanged (int parameterIndex, float newValue) override;
+    void parameterGestureChanged (int, bool) override {}
+    void handleAsyncUpdate() override;
+    void applyPhaseMode();
+    void syncDesignThread (int mode);
+    void stopDesignThread();
 
     static constexpr int preChunk = 2048; // analyser path: input copy kept while the engine works in place
 
     std::array<CoreParameter*, static_cast<size_t> (kickeq::numParams)> parameters {}; // owned by the processor
     std::unique_ptr<kickeq::EqEngine> engine;
+#if KICKEQ_LINEAR_PHASE
+    kickeq::DesignThread designThread; // after the engine: joined before the engine is destroyed
+    std::mutex designMutex;            // start / stop / wake of the design thread (never taken by the audio thread)
+    bool prepared = false;             // guarded by designMutex: between prepareToPlay and releaseResources
+#endif
     std::unique_ptr<kickeq::SpectrumAnalyzer> analyzer;
 
     kickeq::ParamValues audioValues;       // audio thread working copy

@@ -28,8 +28,24 @@ cd /tmp/kickeq && chmod +x kickeq_bench clap_testhost
 | same, all parameters moving | <= 6 % of one core |
 | worst case: 8 cuts at 48 dB/oct | reported only (no budget defined yet) |
 
-`clap_testhost` must end with 0 failed checks (172 on x86/arm64 with threads; the multi-threaded
-section is included on the device if `std::thread` works there).
+`clap_testhost` must end with 0 failed checks (the count depends on the build: the multi-threaded
+section is included on the device if `std::thread` works there; the linear-phase checks only exist in a build with
+`KICKEQ_LINEAR_PHASE=ON`).
+
+### Optional: linear phase (a second build, only after the minimum-phase figures are in)
+
+The CI ARMv7 package is built with `KICKEQ_LINEAR_PHASE=OFF` (the toolchain file's default), so it has no
+linear-phase mode and `kickeq_bench` prints "skipped" for it. To measure it, configure the same toolchain with
+`-DKICKEQ_LINEAR_PHASE=ON` and run the same two commands from that build:
+
+```sh
+cmake -S . -B build-armv7-lp -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/armv7-linux-gnueabihf.cmake \
+      -DKICKEQ_BUILD_JUCE=OFF -DKICKEQ_LINEAR_PHASE=ON && cmake --build build-armv7-lp
+```
+
+The two extra rows ("linear phase 4096, 8 bands, at rest / moving") are reported only: no budget is defined yet.
+They time the `process` calls of the audio thread; the design thread (one kernel design of an 8 band set at N = 4096
+is printed as "kernel design" in ms) runs on the other core. Please report them as well.
 
 ## Please report back
 

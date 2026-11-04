@@ -83,6 +83,7 @@ kickeq::ParamValues randomValues (uint32_t seed)
         const kickeq::ParamInfo& p = kickeq::paramInfo (i);
         v.set (i, p.min + rng.uni() * (p.max - p.min));
     }
+    v.set (kickeq::paramPhaseMode, 0.0f); // these tests compare with the minimum-phase engine; linear phase has its own test
     return v;
 }
 
@@ -102,6 +103,17 @@ kickeq::ParamValues valuesOf (const KickEQProcessor& p)
     p.readValues (v);
     return v;
 }
+
+struct LatencyListener final : juce::AudioProcessorListener
+{
+    int latencyChanges = 0;
+    void audioProcessorParameterChanged (juce::AudioProcessor*, int, float) override {}
+    void audioProcessorChanged (juce::AudioProcessor*, const ChangeDetails& details) override
+    {
+        if (details.latencyChanged)
+            ++latencyChanges;
+    }
+};
 
 struct Counter final : juce::AudioProcessorParameter::Listener
 {
@@ -139,6 +151,7 @@ int main()
                 break;
             }
             const ParamInfo& info = paramInfo (i);
+            const bool pinned = (info.flags & flagNeedsLinearPhase) != 0 && !linearPhaseOn(); // phase_mode without linear phase
             rangesOk = rangesOk && juce::exactlyEqual (p->getNormalisableRange().start, info.min)
                        && juce::exactlyEqual (p->getNormalisableRange().end, info.max);
             defaultsOk = defaultsOk && std::abs (p->convertFrom0to1 (p->getDefaultValue()) - info.def) <= 1.0e-5f * juce::jmax (1.0f, std::abs (info.def))
@@ -152,13 +165,13 @@ int main()
                 const bool good = std::abs (rt - n) < (info.kind == Kind::Float ? 1.0e-5f : 0.5f / static_cast<float> (info.max - info.min) + 1.0e-5f);
                 if (!good)
                     std::printf ("      %s n=%g -> %g\n", info.strId, static_cast<double> (n), static_cast<double> (rt));
-                norm = norm && good;
+                norm = norm && (good || pinned);
             }
             if (info.kind != Kind::Float)
                 textOk = textOk && p->getAllValueStrings().size() == info.numEnumLabels && p->isDiscrete()
                          && p->getNumSteps() == info.numEnumLabels;
         }
-        check (idsOk, "59 parameters, ids == core strId (version hint 1)");
+        check (idsOk, "60 parameters, ids == core strId (version hint 1)");
         check (rangesOk, "parameter ranges == core table");
         check (defaultsOk, "defaults == core table (plain value exact)");
         check (textOk, "text and enum labels == core valueToText");
@@ -362,6 +375,72 @@ int main()
             check (got == (pass == 1), pass == 0 ? "analyser disabled: nothing is pushed" : "analyser enabled: a frame is produced");
         }
         an.setEnabled (false);
+    }
+
+    // ---- linear phase: latency reporting, flat transparency, state, presets ----------------------------------------------------
+    if (linearPhaseOn())
+    {
+        KickEQProcessor lin;
+        LatencyListener listener;
+        lin.addListener (&listener);
+        lin.setPlayConfigDetails (2, 2, rate, 512);
+        lin.prepareToPlay (rate, 512);
+        check (lin.getLatencySamples() == 0, "linear: minimum phase reports no latency");
+
+        // the parameter changes the reported latency, and the host is told (VST3 kLatencyChanged / CLAP restart)
+        lin.getCoreParameter (paramPhaseMode).setPlainNotifyingHost (2.0f);
+        check (lin.getLatencySamples() == 2048 && listener.latencyChanges == 1, "linear: Linear 4096 -> latency 2048, listeners told once");
+        lin.getCoreParameter (paramPhaseMode).setPlainNotifyingHost (2.0f);
+        check (listener.latencyChanges == 1, "linear: same mode again -> no new notification");
+        check (!lin.getCoreParameter (paramPhaseMode).isAutomatable() && lin.getCoreParameter (paramPhaseMode).isDiscrete(),
+               "linear: phase_mode is a discrete parameter that is not automatable");
+
+        // flat EQ: the output is the input delayed by N / 2 samples, bit for bit
+        lin.prepareToPlay (rate, 512);
+        check (lin.getLatencySamples() == 2048, "linear: latency kept over prepareToPlay");
+        Rng rng (77);
+        const int total = 20000;
+        std::vector<float> inL (total), inR (total), outL, outR;
+        for (int i = 0; i < total; ++i)
+        {
+            inL[static_cast<size_t> (i)] = rng.bipolar();
+            inR[static_cast<size_t> (i)] = rng.bipolar();
+        }
+        outL = inL;
+        outR = inR;
+        juce::MidiBuffer midi;
+        for (int pos = 0; pos < total; pos += 480)
+        {
+            const int n = juce::jmin (480, total - pos);
+            float* channels[2] = { outL.data() + pos, outR.data() + pos };
+            juce::AudioBuffer<float> buffer (channels, 2, n);
+            lin.processBlock (buffer, midi);
+        }
+        bool delayed = true;
+        for (int i = 0; i < total; ++i)
+            delayed = delayed && juce::exactlyEqual (outL[static_cast<size_t> (i)], i >= 2048 ? inL[static_cast<size_t> (i - 2048)] : 0.0f)
+                      && juce::exactlyEqual (outR[static_cast<size_t> (i)], i >= 2048 ? inR[static_cast<size_t> (i - 2048)] : 0.0f);
+        check (delayed, "linear: flat EQ == input delayed by 2048 samples (bit-identical)");
+
+        // state: the phase mode is part of the blob; loading it changes the latency, older blobs mean Minimum
+        ParamValues withMode;
+        withMode.set (paramPhaseMode, 3.0f);
+        const auto blob3 = blobOf (withMode);
+        lin.setStateInformation (blob3.data(), static_cast<int> (blob3.size()));
+        check (lin.getPhaseMode() == 3 && lin.getLatencySamples() == 4096 && listener.latencyChanges == 2, "linear: state with Linear 8192 -> latency 4096");
+        juce::MemoryBlock saved;
+        lin.getStateInformation (saved);
+        ParamValues back;
+        check (loadState (static_cast<const uint8_t*> (saved.getData()), saved.getSize(), back) && back.phaseMode() == 3, "linear: saved state carries the phase mode");
+
+        // presets keep the phase mode
+        lin.setCurrentProgram (1);
+        check (lin.getPhaseMode() == 3 && lin.getLatencySamples() == 4096 && lin.findMatchingPreset() == 1, "linear: a preset recall keeps the phase mode");
+
+        const auto blobMin = blobOf (ParamValues {});
+        lin.setStateInformation (blobMin.data(), static_cast<int> (blobMin.size()));
+        check (lin.getPhaseMode() == 0 && lin.getLatencySamples() == 0 && listener.latencyChanges == 3, "linear: Minimum state -> latency 0");
+        lin.removeListener (&listener);
     }
 
     std::printf ("\n%d checks passed, %d failed\n", passed, failed);

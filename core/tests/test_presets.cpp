@@ -120,3 +120,21 @@ TEST (presets_flat_is_transparent_and_all_presets_process_cleanly)
             CHECK (std::fabs (computeAutoGainDb (pv, fs)) <= 12.0);
         }
 }
+
+TEST (presets_recall_keeps_the_phase_mode)
+{
+    // presets shape the tone, not the latency: a recall must not flip the reported latency of a running plugin
+    for (int i = 0; i < numPresets; ++i)
+    {
+        ParamValues pv;
+        pv.set (paramPhaseMode, 2.0f);
+        pv.set (paramOutGain, 5.0f);
+        CHECK (applyPreset (i, pv));
+        CHECK (pv.phaseMode() == (linearPhaseOn() ? 2 : 0));
+        CHECK (pv.outGainDb() == 0.0f); // everything else is reset as before
+    }
+
+    ParamValues minimum;
+    CHECK (applyPreset (1, minimum));
+    CHECK (minimum.phaseMode() == 0); // presets themselves are minimum phase
+}

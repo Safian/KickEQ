@@ -59,16 +59,105 @@ KickEQProcessor::KickEQProcessor()
 
     jassert (index == kickeq::numParams);
     analyzer->prepare (48000.0);
+
+    parameters[static_cast<size_t> (kickeq::paramPhaseMode)]->addListener (this);
 }
 
-KickEQProcessor::~KickEQProcessor() = default;
+KickEQProcessor::~KickEQProcessor()
+{
+    parameters[static_cast<size_t> (kickeq::paramPhaseMode)]->removeListener (this);
+    cancelPendingUpdate();
+    stopDesignThread();
+}
 
 void KickEQProcessor::prepareToPlay (double newSampleRate, int samplesPerBlock)
 {
+    stopDesignThread(); // the engine is about to be re-prepared
     sampleRate.store (newSampleRate, std::memory_order_relaxed);
     engine->prepare (newSampleRate, samplesPerBlock);
     analyzer->prepare (newSampleRate); // not processing: no concurrent push()
     tailSamples.store (0, std::memory_order_relaxed);
+#if KICKEQ_LINEAR_PHASE
+    {
+        const std::lock_guard<std::mutex> lock (designMutex);
+        prepared = true;
+    }
+#endif
+    applyPhaseMode(); // latency, and the design thread when a linear mode is selected
+}
+
+void KickEQProcessor::releaseResources()
+{
+    stopDesignThread();
+}
+
+void KickEQProcessor::stopDesignThread()
+{
+#if KICKEQ_LINEAR_PHASE
+    const std::lock_guard<std::mutex> lock (designMutex);
+    prepared = false;
+    designThread.stop();
+#endif
+}
+
+/** The design thread runs between prepareToPlay and releaseResources while a linear phase mode is selected; in
+    minimum phase there is no thread at all. */
+void KickEQProcessor::syncDesignThread ([[maybe_unused]] int mode)
+{
+#if KICKEQ_LINEAR_PHASE
+    const std::lock_guard<std::mutex> lock (designMutex);
+    if (!prepared)
+        return;
+    if (mode != 0)
+    {
+        if (!designThread.running())
+            if (kickeq::DesignLink* link = engine->designLink())
+                designThread.start (*link);
+        designThread.setActive (true);
+    }
+    else if (designThread.running())
+    {
+        designThread.stop();
+    }
+#endif
+}
+
+int KickEQProcessor::getPhaseMode() const noexcept
+{
+    return static_cast<int> (parameters[static_cast<size_t> (kickeq::paramPhaseMode)]->getPlain());
+}
+
+int KickEQProcessor::getLatencyForMode (int mode) const noexcept
+{
+    return engine->latencyForMode (mode);
+}
+
+void KickEQProcessor::parameterValueChanged (int, float)
+{
+    // the message thread (UI, state, most hosts) applies the new latency right away; any other thread (a host that
+    // writes parameters from its own thread) only raises the async update
+    if (juce::MessageManager::existsAndIsCurrentThread())
+    {
+        cancelPendingUpdate();
+        applyPhaseMode();
+    }
+    else
+    {
+        triggerAsyncUpdate();
+    }
+}
+
+void KickEQProcessor::handleAsyncUpdate()
+{
+    applyPhaseMode();
+}
+
+void KickEQProcessor::applyPhaseMode()
+{
+    const int mode = getPhaseMode();
+    syncDesignThread (mode);
+    // tells the host (VST3 restartComponent (kLatencyChanged), CLAP latency.changed + request_restart) when it changed
+    setLatencySamples (engine->latencyForMode (mode));
 }
 
 void KickEQProcessor::acquireAnalyzer() noexcept
@@ -172,6 +261,7 @@ int KickEQProcessor::findMatchingPreset() const noexcept
     current.clamp();
     for (int i = 0; i < kickeq::numPresets; ++i)
     {
+        preset = current; // a preset recall keeps the phase mode, so it does not take part in the comparison
         kickeq::applyPreset (i, preset);
         if (preset == current)
             return i;
@@ -188,6 +278,7 @@ int KickEQProcessor::getCurrentProgram()
 void KickEQProcessor::setCurrentProgram (int index)
 {
     kickeq::ParamValues values;
+    readValues (values); // keeps the phase mode (applyPreset)
     if (!kickeq::applyPreset (index, values))
         return;
     lastProgram.store (index, std::memory_order_relaxed);
@@ -258,6 +349,7 @@ void KickEQProcessor::setStateInformation (const void* data, int sizeInBytes)
     setEditorSettingsInternal (kickeq::ui::EditorSettings::fromChunk (ui.data, ui.size));
     for (int i = 0; i < kickeq::numParams; ++i)
         parameters[static_cast<size_t> (i)]->setPlainNotifyingHost (values.get (i)); // exact plain value, host + UI notified
+    applyPhaseMode(); // a state with another phase mode changes the latency
 
     // A state load changes every parameter value: CLAP requires a params rescan for that (clap-validator
     // state-reproducibility tests); the clap-juce wrapper turns parameterInfoChanged into VALUES|TEXT|INFO.

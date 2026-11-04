@@ -26,6 +26,14 @@
 //           with sample-accurate events in every block
 //   worst   8 cuts (4 low, 4 high) at 48 dB/oct, at rest                               budget 6 % (the "moving"
 //           budget: section 9 names no separate figure for the worst case)
+//   linear  the "rest" and the "moving" set in linear-phase mode, N = 4096 (latency 2048), with a running design
+//           thread: reported only, no budget is defined yet (ARCHITECTURE.md section 4.7); skipped when the core is
+//           built without KICKEQ_LINEAR_PHASE. Only the audio thread's process () calls are timed (the design thread
+//           runs on another core); the blocks are paced at 1 ms so that kernels arrive at a realistic rate
+//           (one per ~12 ms of wall time, i.e. every few blocks while parameters move). The cost of one kernel
+//           design is measured separately and printed below the table.
+//           `--no-threads` runs the linear-phase scenarios on a bare EqEngine instead of the shell (no design thread;
+//           a designer step between blocks plays its part): for emulators where thread creation crashes (qemu-user).
 // Output: ns per sample frame (both channels) and the share of one core at 48 kHz. `--check` exits with 1
 // when a scenario costs more than 25 times its budget on this machine: a loose regression guard that also
 // holds under QEMU user emulation; the real figures come from the MPC hardware.
@@ -35,12 +43,18 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <thread>
 #include <vector>
 
 #include <clap/clap.h>
 
 #include "kickeq/clap_native.h"
 #include "kickeq/params.h"
+
+#include "kickeq/eq_engine.h"
+#if KICKEQ_LINEAR_PHASE
+#include "kickeq/linear_phase.h"
+#endif
 
 namespace
 {
@@ -132,9 +146,10 @@ ParamValues worstCase()
 struct Scenario
 {
     const char* name;
-    double budgetPercent;
+    double budgetPercent; // 0: reported only
     ParamValues values;
     bool moving;
+    bool paced = false;   // linear phase: time process () calls only, 1 ms apart, with a prelude for the design thread
 };
 
 struct Result
@@ -155,7 +170,23 @@ Result run (const clap_plugin_factory_t* factory, const Scenario& sc)
     host.request_callback = &noop;
 
     const clap_plugin_t* p = factory->create_plugin (factory, &host, "com.safian.kickeq");
-    if (p == nullptr || !p->init (p) || !p->activate (p, sampleRate, blockSize, blockSize) || !p->start_processing (p))
+    if (p == nullptr || !p->init (p))
+        return { 0.0, 0.0, false };
+
+    if (sc.values.phaseMode() != 0)
+    {
+        // the phase mode is read when the plugin is activated (it changes the latency): set it before, through a flush
+        const auto* params = static_cast<const clap_plugin_params_t*> (p->get_extension (p, CLAP_EXT_PARAMS));
+        Events setup;
+        setup.blocks.resize (1);
+        setup.blocks[0].events.push_back (makeEvent (0, paramPhaseMode, static_cast<double> (sc.values.get (paramPhaseMode))));
+        setup.current = &setup.blocks[0];
+        clap_input_events_t in = { &setup, &Events::size, &Events::get };
+        clap_output_events_t out = { nullptr, &pushOut };
+        params->flush (p, &in, &out);
+    }
+
+    if (!p->activate (p, sampleRate, blockSize, blockSize) || !p->start_processing (p))
         return { 0.0, 0.0, false };
 
     // initial values: one event block at time 0 for every parameter
@@ -223,16 +254,46 @@ Result run (const clap_plugin_factory_t* factory, const Scenario& sc)
         ++counter;
     };
 
+    using Clock = std::chrono::steady_clock;
+    const auto pace = [&] { std::this_thread::sleep_for (std::chrono::milliseconds (1)); };
+
+    if (sc.paced)
+    {
+        // the design thread needs wall time for the first kernel: ~1.5 s of paced blocks, then the usual warm-up
+        for (int i = 0; i < 1500; ++i)
+        {
+            block();
+            pace();
+        }
+    }
     for (int i = 0; i < warmupBlocks; ++i)
+    {
         block();
+        if (sc.paced)
+            pace();
+    }
 
     double best = 1.0e300;
     for (int r = 0; r < repetitions; ++r)
     {
-        const auto t0 = std::chrono::steady_clock::now();
-        for (int i = 0; i < measureBlocks; ++i)
-            block();
-        const double ns = std::chrono::duration<double, std::nano> (std::chrono::steady_clock::now() - t0).count();
+        double ns = 0.0;
+        if (sc.paced)
+        {
+            for (int i = 0; i < measureBlocks; ++i)
+            {
+                const auto t0 = Clock::now();
+                block();
+                ns += std::chrono::duration<double, std::nano> (Clock::now() - t0).count();
+                pace();
+            }
+        }
+        else
+        {
+            const auto t0 = Clock::now();
+            for (int i = 0; i < measureBlocks; ++i)
+                block();
+            ns = std::chrono::duration<double, std::nano> (Clock::now() - t0).count();
+        }
         best = std::min (best, ns);
     }
 
@@ -247,43 +308,169 @@ Result run (const clap_plugin_factory_t* factory, const Scenario& sc)
     const double perFrame = best / (static_cast<double> (measureBlocks) * blockSize);
     return { perFrame, perFrame * sampleRate / 1.0e9 * 100.0, finite };
 }
+#if KICKEQ_LINEAR_PHASE
+/** The linear-phase scenarios without the shell and without a thread: process () of a bare engine is timed, a designer
+    step runs between the blocks at the pace of the design thread (one design per 12 ms of audio while parameters move).
+    The parameters move like in the shell scenario (two target changes per block). */
+Result runDirect (const Scenario& sc)
+{
+    EqEngine engine;
+    engine.prepare (sampleRate, static_cast<int> (blockSize));
+    LinearPhaseDesigner designer;
+    uint64_t designed = 0;
+    const int designEveryBlocks = static_cast<int> (0.012 * sampleRate / blockSize) + 1; // ~12 ms
+
+    std::vector<float> l (blockSize), r (blockSize);
+    uint32_t seed = 12345;
+    const auto fillNoise = [&] {
+        for (uint32_t i = 0; i < blockSize; ++i)
+        {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            l[i] = static_cast<float> (static_cast<int32_t> (seed)) * (1.0f / 4294967296.0f);
+            r[i] = l[i];
+        }
+    };
+
+    const auto moved = [&] (int blk, int half) {
+        ParamValues v = sc.values;
+        if (!sc.moving)
+            return v;
+        const double phase = (static_cast<double> (blk % patternBlocks) + 0.5 * half) / patternBlocks;
+        for (int b = 0; b < numBands; ++b)
+        {
+            const double ph = 6.283185307179586 * (phase * (1.0 + b) + 0.13 * b);
+            v.set (b, BandParam::freq, static_cast<float> (static_cast<double> (sc.values.get (b, BandParam::freq)) * (1.0 + 0.3 * std::sin (ph))));
+            v.set (b, BandParam::gain, static_cast<float> (static_cast<double> (sc.values.get (b, BandParam::gain)) + 6.0 * std::sin (1.3 * ph)));
+            v.set (b, BandParam::q, static_cast<float> (static_cast<double> (sc.values.get (b, BandParam::q)) * (1.0 + 0.4 * std::sin (0.7 * ph))));
+        }
+        v.set (paramOutGain, static_cast<float> (3.0 * std::sin (2.0 * 6.283185307179586 * phase)));
+        return v;
+    };
+
+    int counter = 0;
+    double processNs = 0.0;
+    const auto block = [&] (bool timed) {
+        fillNoise();
+        const ParamValues a = moved (counter, 0), b = moved (counter, 1);
+        const auto t0 = std::chrono::steady_clock::now();
+        engine.process (a, l.data(), r.data(), static_cast<int> (blockSize / 2));
+        engine.process (b, l.data() + blockSize / 2, r.data() + blockSize / 2, static_cast<int> (blockSize / 2));
+        if (timed)
+            processNs += std::chrono::duration<double, std::nano> (std::chrono::steady_clock::now() - t0).count();
+        ++counter;
+        if (counter % designEveryBlocks == 0 || counter == 1)
+            designed = serviceDesignRequest (*engine.designLink(), designer, designed);
+    };
+
+    for (int i = 0; i < 100; ++i) // the first kernel and the warm-up
+        block (false);
+    for (int i = 0; i < warmupBlocks; ++i)
+        block (false);
+
+    double best = 1.0e300;
+    for (int rep = 0; rep < repetitions; ++rep)
+    {
+        processNs = 0.0;
+        for (int i = 0; i < measureBlocks; ++i)
+            block (true);
+        best = std::min (best, processNs);
+    }
+
+    bool finite = true;
+    for (float x : l)
+        finite = finite && std::isfinite (x);
+    const double perFrame = best / (static_cast<double> (measureBlocks) * blockSize);
+    return { perFrame, perFrame * sampleRate / 1.0e9 * 100.0, finite };
+}
+#endif
 } // namespace
 
 int main (int argc, char** argv)
 {
-    bool check = false;
+    bool check = false, noThreads = false;
     for (int i = 1; i < argc; ++i)
     {
         if (std::strcmp (argv[i], "--check") == 0)
         {
             check = true;
         }
+        else if (std::strcmp (argv[i], "--no-threads") == 0)
+        {
+            noThreads = true;
+        }
         else
         {
-            std::fprintf (stderr, "usage: %s [--check]\n", argv[0]);
+            std::fprintf (stderr, "usage: %s [--check] [--no-threads]\n", argv[0]);
             return 2;
         }
     }
 
     const clap_plugin_factory_t* factory = kickeq_get_plugin_factory();
-    const Scenario scenarios[3] = {
+    std::vector<Scenario> scenarios = {
         { "8 bands (2 cuts 24 dB/oct), at rest", 3.0, typical(), false },
         { "8 bands, all parameters moving", 6.0, typical(), true },
         { "worst case: 8 cuts at 48 dB/oct", 6.0, worstCase(), false }
     };
+    if (linearPhaseOn())
+    {
+        ParamValues rest = typical(), moving = typical();
+        rest.set (paramPhaseMode, 2.0f); // Linear 4096
+        moving.set (paramPhaseMode, 2.0f);
+        scenarios.push_back ({ "linear phase 4096, 8 bands, at rest", 0.0, rest, false, true });
+        scenarios.push_back ({ "linear phase 4096, 8 bands, moving", 0.0, moving, true, true });
+    }
 
     std::printf ("kickeq_bench: native shell process(), %.0f Hz, %u frames, stereo\n\n", sampleRate, blockSize);
     std::printf ("%-40s %12s %10s %10s %8s\n", "scenario", "ns/frame", "% of core", "budget %", "x budget");
     bool failed = false;
     for (const Scenario& sc : scenarios)
     {
+#if KICKEQ_LINEAR_PHASE
+        const Result r = sc.paced && noThreads ? runDirect (sc) : run (factory, sc);
+#else
         const Result r = run (factory, sc);
-        const double ratio = r.percentCore / sc.budgetPercent;
-        std::printf ("%-40s %12.1f %10.3f %10.1f %8.2f%s\n", sc.name, r.nsPerFrame, r.percentCore, sc.budgetPercent, ratio,
-                     r.finite ? "" : "  NOT FINITE");
-        if (!r.finite || r.nsPerFrame <= 0.0 || (check && ratio > guardFactor))
-            failed = true;
+#endif
+        if (sc.budgetPercent > 0.0)
+        {
+            const double ratio = r.percentCore / sc.budgetPercent;
+            std::printf ("%-40s %12.1f %10.3f %10.1f %8.2f%s\n", sc.name, r.nsPerFrame, r.percentCore, sc.budgetPercent, ratio,
+                         r.finite ? "" : "  NOT FINITE");
+            if (!r.finite || r.nsPerFrame <= 0.0 || (check && ratio > guardFactor))
+                failed = true;
+        }
+        else
+        {
+            std::printf ("%-40s %12.1f %10.3f %10s %8s%s\n", sc.name, r.nsPerFrame, r.percentCore, "(none)", "-",
+                         r.finite ? "" : "  NOT FINITE");
+            if (!r.finite || r.nsPerFrame <= 0.0)
+                failed = true;
+        }
     }
+    if (!linearPhaseOn())
+        std::printf ("%-40s skipped: built without KICKEQ_LINEAR_PHASE\n", "linear phase 4096");
+    else
+        std::printf ("%-40s reported only: no budget is defined yet (ARCHITECTURE.md section 4.7); process () timing, design thread excluded%s\n",
+                     "linear phase 4096", noThreads ? " (--no-threads: bare engine, no shell)" : "");
+
+#if KICKEQ_LINEAR_PHASE
+    {
+        // cost of one kernel design on the design thread (best of 5)
+        LinearPhaseDesigner designer;
+        KernelSet set;
+        ParamValues pv = typical();
+        pv.set (paramPhaseMode, 2.0f);
+        double best = 1.0e300;
+        for (int i = 0; i < 5; ++i)
+        {
+            const auto t0 = std::chrono::steady_clock::now();
+            designer.design (pv, sampleRate, 1, set);
+            best = std::min (best, std::chrono::duration<double, std::milli> (std::chrono::steady_clock::now() - t0).count());
+        }
+        std::printf ("%-40s %12.2f ms (design thread, one kernel set, N = 4096, 8 bands)\n", "kernel design", best);
+    }
+#endif
     if (check)
         std::printf ("\ncheck: %s (limit %.0fx budget)\n", failed ? "FAILED" : "ok", guardFactor);
     return check && failed ? 1 : 0;

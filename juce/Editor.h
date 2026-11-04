@@ -67,17 +67,21 @@ private:
     juce::ToggleButton bypassButton { "Bypass" }, autoGainButton { "Auto Gain" };
     juce::Slider outputSlider;
     juce::ComboBox sourceBox, rangeBox, slopeBox, curveRangeBox, viewBox;
+    juce::ComboBox phaseBox; // phase_mode: Minimum / Linear 2048 / 4096 / 8192 (hidden when the core has no linear phase)
 
     std::unique_ptr<juce::ButtonParameterAttachment> bypassAttachment, autoGainAttachment;
+    std::unique_ptr<juce::ComboBoxParameterAttachment> phaseAttachment;
     std::unique_ptr<juce::SliderParameterAttachment> outputAttachment;
 
     kickeq::SpectrumFrame frame;
     kickeq::ui::EditorSettings shownSettings;
     int shownPreset = -2;
+    int shownLatencySamples = -1;
+    double shownRate = 0.0;
     bool updatingControls = false;
 
     juce::Rectangle<int> headerArea, toolbarArea;
-    juce::Rectangle<float> outputCaption, analyserCaption, slopeCaption, curveCaption, viewCaption;
+    juce::Rectangle<float> outputCaption, analyserCaption, slopeCaption, curveCaption, viewCaption, latencyCaption;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (KickEQEditor)
 };

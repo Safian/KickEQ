@@ -21,6 +21,8 @@
 
 #include <cfloat>
 #include <cmath>
+#include <memory>
+#include <new>
 
 #include "kickeq/eq_curve.h"
 
@@ -28,6 +30,26 @@ namespace kickeq
 {
 using detail::BandState;
 using detail::Voice;
+
+namespace detail
+{
+#if KICKEQ_LINEAR_PHASE
+/** Everything the linear-phase mode needs, in one heap block. */
+struct LinearStage
+{
+    PartitionedConvolver convolver;
+    DesignLink link;
+    std::unique_ptr<LinearPhaseDesigner> designer; // only created by designSynchronously
+    uint64_t synchronouslyDesigned = 0;
+    float wet[2][EqEngine::segmentLength] = {};
+    float dry[2][EqEngine::segmentLength] = {};
+};
+#else
+struct LinearStage
+{
+};
+#endif
+} // namespace detail
 
 namespace
 {
@@ -64,9 +86,32 @@ float toOutput (double v, bool& fault) noexcept
 }
 
 int normalisedSlope (const BandParams& p) noexcept { return isCutType (p.type) ? p.slopeIndex : 0; }
+
+#if KICKEQ_LINEAR_PHASE
+/** True when a band that is on in either snapshot differs between them (what changes the response). */
+bool bandsDiffer (const ParamValues& a, const ParamValues& b) noexcept
+{
+    for (int i = 0; i < numBands; ++i)
+    {
+        if (a.get (i, BandParam::on) < 0.5f && b.get (i, BandParam::on) < 0.5f)
+            continue;
+        for (int k = 0; k < paramsPerBand; ++k)
+            if (a.get (numGlobalParams + i * paramsPerBand + k) != b.get (numGlobalParams + i * paramsPerBand + k))
+                return true;
+    }
+    return false;
+}
+#endif
 } // namespace
 
 EqEngine::EqEngine() noexcept { prepare (48000.0, 512); }
+
+EqEngine::~EqEngine() = default;
+
+int EqEngine::latencyForMode (int mode) const noexcept
+{
+    return linear != nullptr ? phaseModeLatency (mode) : 0;
+}
 
 void EqEngine::prepare (double newSampleRate, int maxBlock) noexcept
 {
@@ -80,6 +125,11 @@ void EqEngine::prepare (double newSampleRate, int maxBlock) noexcept
     const double fade = std::floor (fadeSeconds * sr + 0.5);
     fadeSamples = fade < 1.0 ? 1 : static_cast<int> (fade);
     fadeInverse = 1.0 / static_cast<double> (fadeSamples);
+
+#if KICKEQ_LINEAR_PHASE
+    if (linear == nullptr)
+        linear.reset (new (std::nothrow) detail::LinearStage());
+#endif
 
     reset();
 }
@@ -105,6 +155,19 @@ void EqEngine::reset() noexcept
     dspActive = false;
     tailSamples = 0;
     lastTarget.setDefaults();
+    lastRequested.setDefaults();
+    path = Path::minimum;
+    stageMode = 0;
+    mixPos = 0;
+    warmSamples = 0;
+    targetMode.store (0, std::memory_order_relaxed);
+#if KICKEQ_LINEAR_PHASE
+    if (linear != nullptr)
+    {
+        linear->convolver.clear();
+        linear->link.kernels.dropCurrent();
+    }
+#endif
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -112,6 +175,40 @@ void EqEngine::reset() noexcept
 // ---------------------------------------------------------------------------------------------------------
 
 void EqEngine::updateControl (const ParamValues& target) noexcept
+{
+#if KICKEQ_LINEAR_PHASE
+    if (linear != nullptr)
+    {
+        const int mode = target.phaseMode();
+        targetMode.store (mode, std::memory_order_relaxed);
+
+        if (!initialised && mode != 0)
+        {
+            initLinear (target, mode);
+            return;
+        }
+
+        if (initialised)
+        {
+            if (path == Path::minimum && mode != 0)
+                beginMinToLinear (target, mode);
+            else if (path == Path::linear && mode != stageMode)
+                beginLinearToMin (target);
+
+            if (path == Path::linear)
+            {
+                updateControlLinear (target);
+                return;
+            }
+            if (path != Path::minimum)
+                requestDesignIfChanged (target); // the kernels keep following the parameters during a transition
+        }
+    }
+#endif
+    updateControlMin (target);
+}
+
+void EqEngine::updateControlMin (const ParamValues& target) noexcept
 {
     const bool wantBypass = target.bypass();
 
@@ -205,6 +302,16 @@ void EqEngine::designNewest (BandState& band) noexcept
 
 void EqEngine::snapBuild (const ParamValues& t) noexcept
 {
+    buildBands (t);
+    snapGains (t);
+
+    lastTarget = t;
+    updateTail (t);
+    dspActive = true;
+}
+
+void EqEngine::buildBands (const ParamValues& t) noexcept
+{
     dropAll();
 
     for (int i = 0; i < numBands; ++i)
@@ -229,7 +336,10 @@ void EqEngine::snapBuild (const ParamValues& t) noexcept
             designNewest (b);
         }
     }
+}
 
+void EqEngine::snapGains (const ParamValues& t) noexcept
+{
     outGain.snap (t.outGainDb());
     if (t.autoGain())
     {
@@ -246,10 +356,6 @@ void EqEngine::snapBuild (const ParamValues& t) noexcept
     gainA = gainB = dbToLinear (outGain.value + autoGain.value);
     gainRamp = false;
     gainDirty = false;
-
-    lastTarget = t;
-    updateTail (t);
-    dspActive = true;
 }
 
 void EqEngine::retargetBand (BandState& band, const BandParams& p, int slope) noexcept
@@ -357,6 +463,16 @@ void EqEngine::applyTargets (const ParamValues& t) noexcept
                     dirty = true;
     }
 
+    applyGainTargets (t, dirty);
+
+    if (dirty)
+        updateTail (t);
+    lastTarget = t;
+}
+
+void EqEngine::applyGainTargets (const ParamValues& t, bool dirty) noexcept
+{
+    const uint64_t now = sampleCount;
     outGain.setTarget (t.outGainDb(), now, smoothSamples);
 
     double autoTarget = 0.0;
@@ -377,10 +493,6 @@ void EqEngine::applyTargets (const ParamValues& t) noexcept
 
     if (outGain.active || autoGain.active)
         gainDirty = true;
-
-    if (dirty)
-        updateTail (t);
-    lastTarget = t;
 }
 
 void EqEngine::updateTail (const ParamValues& t) noexcept
@@ -420,14 +532,17 @@ void EqEngine::updateTail (const ParamValues& t) noexcept
         seconds = s > seconds ? s : seconds;
     }
 
+    // linear phase: the FIR adds its N samples (the delayed signal and the kernel's own length)
+    const uint32_t firLength = linear != nullptr ? static_cast<uint32_t> (phaseModeLength (targetMode.load (std::memory_order_relaxed))) : 0u;
+
     if (!any)
     {
-        tailSamples = 0;
+        tailSamples = firLength;
         return;
     }
 
     seconds = (seconds < maxTailSeconds ? seconds : maxTailSeconds) + fadeSeconds + smoothSeconds;
-    tailSamples = static_cast<uint32_t> (std::ceil (seconds * sampleRate));
+    tailSamples = static_cast<uint32_t> (std::ceil (seconds * sampleRate)) + firLength;
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -435,6 +550,12 @@ void EqEngine::updateTail (const ParamValues& t) noexcept
 // ---------------------------------------------------------------------------------------------------------
 
 void EqEngine::tick (uint64_t time) noexcept
+{
+    tickBands (time);
+    tickGains (time);
+}
+
+void EqEngine::tickBands (uint64_t time) noexcept
 {
     for (auto& b : bands)
     {
@@ -446,7 +567,10 @@ void EqEngine::tick (uint64_t time) noexcept
         if (b.newest >= 0)
             designNewest (b);
     }
+}
 
+void EqEngine::tickGains (uint64_t time) noexcept
+{
     if (gainDirty)
     {
         outGain.update (time, smoothSamples);
@@ -478,12 +602,27 @@ void EqEngine::process (const ParamValues& target, float* left, float* right, in
         const uint32_t grid = static_cast<uint32_t> (sampleCount & (segmentLength - 1));
         const int seg = numSamples - pos < static_cast<int> (segmentLength - grid) ? numSamples - pos
                                                                                    : static_cast<int> (segmentLength - grid);
-        if (dspActive)
+        if (path == Path::minimum)
+        {
+            if (dspActive)
+            {
+                if (grid == 0)
+                    tick (sampleCount);
+                processSegment (left + pos, right != nullptr ? right + pos : nullptr, seg, grid);
+            }
+        }
+#if KICKEQ_LINEAR_PHASE
+        else
         {
             if (grid == 0)
-                tick (sampleCount);
-            processSegment (left + pos, right != nullptr ? right + pos : nullptr, seg, grid);
+            {
+                if (dspActive)
+                    tickBands (sampleCount);
+                tickGains (sampleCount);
+            }
+            processSegmentMixed (left + pos, right != nullptr ? right + pos : nullptr, seg, grid);
         }
+#endif
         sampleCount += static_cast<uint64_t> (seg);
         pos += seg;
     }
@@ -531,7 +670,7 @@ void EqEngine::applyBand (int bandIndex, Placement place, int lane, int n) noexc
     }
 }
 
-void EqEngine::processSegment (float* l, float* r, int n, uint32_t gridPos) noexcept
+bool EqEngine::computeMinWet (const float* l, const float* r, int n, bool force) noexcept
 {
     bool anyVoice = false, anyMidSide = false;
     for (int b = 0; b < numBands; ++b)
@@ -552,8 +691,8 @@ void EqEngine::processSegment (float* l, float* r, int n, uint32_t gridPos) noex
     }
 
     // nothing to do: the (sanitised) input already is the output, bit for bit
-    if (!anyVoice && !gainRamp && gainA == 1.0 && !bypassActive)
-        return;
+    if (!force && !anyVoice && !gainRamp && gainA == 1.0 && !bypassActive)
+        return false;
 
     double* w0 = work[0];
     double* w1 = work[1];
@@ -596,8 +735,16 @@ void EqEngine::processSegment (float* l, float* r, int n, uint32_t gridPos) noex
             w1[i] = m - s;
         }
     }
+    return true;
+}
 
-    // output gain (linear interpolation across the 32-sample cell), bypass cross-fade, conversion
+bool EqEngine::finishSegment (const double* dry0, const double* dry1, float* l, float* r, int n, uint32_t gridPos) noexcept
+{
+    // output gain (linear interpolation across the 32-sample cell), bypass cross-fade, conversion; the processed
+    // signal is in work[], the unprocessed (possibly delayed) one in dry0 / dry1
+    const double* w0 = work[0];
+    const double* w1 = work[1];
+    const bool mono = (r == nullptr);
     bool fault = false;
     for (int i = 0; i < n; ++i)
     {
@@ -619,20 +766,28 @@ void EqEngine::processSegment (float* l, float* r, int n, uint32_t gridPos) noex
         {
             double mix = bypassFrom + bypassDir * (bypassSamples + i) * fadeInverse;
             mix = bypassDir > 0.0 ? (mix > bypassTarget ? bypassTarget : mix) : (mix < bypassTarget ? bypassTarget : mix);
-            const double d0 = l[i];
-            const double d1 = mono ? d0 : static_cast<double> (r[i]);
+            const double d0 = dry0[i];
+            const double d1 = mono ? d0 : dry1[i];
             y0 = d0 + mix * (y0 - d0);
             y1 = d1 + mix * (y1 - d1);
+        }
+        else if (bypassMix == 0.0)
+        {
+            // bypassed at rest while the linear-phase path runs (minimum phase stops processing instead): the
+            // output is the dry signal, delayed by the latency like the processed one
+            y0 = dry0[i];
+            y1 = mono ? y0 : dry1[i];
         }
 
         l[i] = toOutput (y0, fault);
         if (!mono)
             r[i] = toOutput (y1, fault);
     }
+    return fault;
+}
 
-    if (fault)
-        resetStates();
-
+void EqEngine::advanceMinFades (int n) noexcept
+{
     for (int b = 0; b < numBands; ++b)
     {
         BandState& band = bands[b];
@@ -657,22 +812,263 @@ void EqEngine::processSegment (float* l, float* r, int n, uint32_t gridPos) noex
             band.fadeProgress = 0;
         }
     }
+}
 
-    if (bypassActive)
+void EqEngine::advanceBypass (int n) noexcept
+{
+    if (!bypassActive)
+        return;
+
+    bypassSamples += n;
+    const double now = bypassNow();
+    if (now == bypassTarget)
     {
-        bypassSamples += n;
-        const double now = bypassNow();
-        if (now == bypassTarget)
+        bypassActive = false;
+        bypassMix = bypassTarget;
+        // bypassed at rest: stop the minimum-phase filters (the linear-phase path keeps running its delay line)
+        if (bypassMix == 0.0 && path == Path::minimum)
         {
-            bypassActive = false;
-            bypassMix = bypassTarget;
-            if (bypassMix == 0.0)
-            {
-                dropAll();
-                dspActive = false;
-                tailSamples = 0;
-            }
+            dropAll();
+            dspActive = false;
+            tailSamples = 0;
         }
     }
 }
+
+void EqEngine::processSegment (float* l, float* r, int n, uint32_t gridPos) noexcept
+{
+    if (!computeMinWet (l, r, n, false))
+        return;
+
+    const bool mono = (r == nullptr);
+    for (int i = 0; i < n; ++i)
+    {
+        dryBuf[0][i] = l[i];
+        dryBuf[1][i] = mono ? l[i] : r[i];
+    }
+
+    if (finishSegment (dryBuf[0], dryBuf[1], l, r, n, gridPos))
+        resetStates();
+
+    advanceMinFades (n);
+    advanceBypass (n);
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// Linear-phase path
+// ---------------------------------------------------------------------------------------------------------
+
+#if KICKEQ_LINEAR_PHASE
+DesignLink* EqEngine::designLink() noexcept { return linear != nullptr ? &linear->link : nullptr; }
+
+void EqEngine::requestDesign (const ParamValues& values) noexcept
+{
+    if (linear != nullptr)
+        linear->link.request (values, sampleRate);
+}
+
+uint64_t EqEngine::paramSequence() const noexcept
+{
+    return linear != nullptr ? linear->link.requestSequence() : 0;
+}
+
+uint64_t EqEngine::appliedKernelSequence() const noexcept
+{
+    return linear != nullptr ? linear->link.kernels.appliedSequence() : 0;
+}
+
+void EqEngine::designSynchronously (const ParamValues& values)
+{
+    if (linear == nullptr)
+        return;
+    if (!linear->designer)
+        linear->designer.reset (new (std::nothrow) LinearPhaseDesigner());
+    if (!linear->designer)
+        return;
+    linear->link.request (values, sampleRate);
+    linear->synchronouslyDesigned = serviceDesignRequest (linear->link, *linear->designer, linear->synchronouslyDesigned);
+}
+
+void EqEngine::postDesignRequest (const ParamValues& target) noexcept
+{
+    // the kernels must match the mode the convolver runs, not the one the target may already ask for
+    ParamValues request = target;
+    request.set (paramPhaseMode, static_cast<float> (stageMode));
+    linear->link.request (request, sampleRate);
+    lastRequested = request;
+}
+
+void EqEngine::requestDesignIfChanged (const ParamValues& target) noexcept
+{
+    if (bandsDiffer (lastRequested, target) || lastRequested.phaseMode() != stageMode)
+        postDesignRequest (target);
+}
+
+void EqEngine::initLinear (const ParamValues& t, int mode) noexcept
+{
+    initialised = true;
+    stageMode = mode;
+    linear->link.kernels.dropCurrent();
+    linear->convolver.start (mode, sampleRate);
+    path = Path::linear;
+    mixPos = 0;
+    warmSamples = 0;
+
+    bypassMix = bypassFrom = bypassTarget = t.bypass() ? 0.0 : 1.0;
+    bypassActive = false;
+    dspActive = false; // the minimum-phase filters do not run
+    snapGains (t);
+    lastTarget = t;
+    updateTail (t);
+    postDesignRequest (t);
+}
+
+void EqEngine::beginMinToLinear (const ParamValues& t, int mode) noexcept
+{
+    stageMode = mode;
+    linear->link.kernels.dropCurrent();
+    linear->convolver.start (mode, sampleRate);
+    path = Path::minToLinear;
+    mixPos = 0;
+    warmSamples = phaseModeLatency (mode);
+    postDesignRequest (t);
+    updateTail (t);
+}
+
+void EqEngine::beginLinearToMin (const ParamValues& t) noexcept
+{
+    path = Path::linearToMin;
+    mixPos = 0;
+    warmSamples = 0;
+    if (t.bypass() && bypassMix == 0.0 && !bypassActive)
+    {
+        dropAll();
+        dspActive = false; // bypassed at rest: nothing to build
+    }
+    else
+    {
+        buildBands (t);
+        dspActive = true;
+    }
+    lastTarget = t;
+    updateTail (t);
+}
+
+void EqEngine::updateControlLinear (const ParamValues& t) noexcept
+{
+    const bool wantBypass = t.bypass();
+    if (wantBypass != (bypassTarget == 0.0))
+        startBypassRamp (wantBypass ? 0.0 : 1.0);
+
+    const bool dirty = bandsDiffer (lastTarget, t);
+    applyGainTargets (t, dirty);
+    if (dirty)
+        updateTail (t);
+    requestDesignIfChanged (t);
+    lastTarget = t;
+}
+
+double EqEngine::pathWeight (int offset) const noexcept
+{
+    switch (path)
+    {
+        case Path::linear:
+            return 1.0;
+        case Path::minToLinear:
+        {
+            const int t = mixPos + offset - warmSamples;
+            if (t <= 0)
+                return 0.0;
+            const double w = t * fadeInverse;
+            return w > 1.0 ? 1.0 : w;
+        }
+        case Path::linearToMin:
+        {
+            const double w = 1.0 - (mixPos + offset) * fadeInverse;
+            return w < 0.0 ? 0.0 : w;
+        }
+        case Path::minimum:
+        default:
+            return 0.0;
+    }
+}
+
+void EqEngine::finishTransition() noexcept
+{
+    if (path == Path::minToLinear && mixPos - warmSamples >= fadeSamples)
+    {
+        path = Path::linear;
+        dropAll();
+        dspActive = false;
+    }
+    else if (path == Path::linearToMin && mixPos >= fadeSamples)
+    {
+        path = Path::minimum;
+        stageMode = 0;
+        if (bypassMix == 0.0 && !bypassActive)
+        {
+            dropAll();
+            dspActive = false; // bypassed at rest
+        }
+        updateTail (lastTarget);
+    }
+}
+
+void EqEngine::processSegmentMixed (float* l, float* r, int n, uint32_t gridPos) noexcept
+{
+    detail::LinearStage& ls = *linear;
+    const bool mono = (r == nullptr);
+    const float* inR = mono ? l : r;
+
+    ls.convolver.process (&ls.link.kernels, l, inR, ls.wet[0], ls.wet[1], ls.dry[0], ls.dry[1], n);
+
+    double* w0 = work[0];
+    double* w1 = work[1];
+
+    if (path == Path::linear)
+    {
+        for (int i = 0; i < n; ++i)
+        {
+            w0[i] = ls.wet[0][i];
+            w1[i] = ls.wet[1][i];
+            dryBuf[0][i] = ls.dry[0][i];
+            dryBuf[1][i] = ls.dry[1][i];
+        }
+    }
+    else
+    {
+        // both paths run: out = (1 - m) minimum + m linear, for the processed and for the dry signal alike
+        computeMinWet (l, r, n, true);
+        for (int i = 0; i < n; ++i)
+        {
+            const double m = pathWeight (i);
+            const double k = 1.0 - m;
+            const double in1 = mono ? static_cast<double> (l[i]) : static_cast<double> (r[i]);
+            w0[i] = k * w0[i] + m * ls.wet[0][i];
+            w1[i] = k * w1[i] + m * ls.wet[1][i];
+            dryBuf[0][i] = k * l[i] + m * ls.dry[0][i];
+            dryBuf[1][i] = k * in1 + m * ls.dry[1][i];
+        }
+    }
+
+    if (finishSegment (dryBuf[0], dryBuf[1], l, r, n, gridPos))
+    {
+        resetStates();
+        ls.convolver.clear();
+    }
+
+    if (path != Path::linear)
+        advanceMinFades (n);
+    advanceBypass (n);
+
+    mixPos += n;
+    finishTransition();
+}
+#else
+DesignLink* EqEngine::designLink() noexcept { return nullptr; }
+void EqEngine::requestDesign (const ParamValues&) noexcept {}
+uint64_t EqEngine::paramSequence() const noexcept { return 0; }
+uint64_t EqEngine::appliedKernelSequence() const noexcept { return 0; }
+void EqEngine::designSynchronously (const ParamValues&) {}
+#endif
 } // namespace kickeq

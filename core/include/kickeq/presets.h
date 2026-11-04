@@ -136,15 +136,18 @@ inline constexpr Preset factoryPresets[numPresets] = {
 };
 
 /** Resets `values` to the defaults and applies the preset's overrides (a recall therefore also resets bypass,
-    output gain and auto gain, which no preset sets). Returns false (values untouched) for an index outside
-    0 .. numPresets - 1. */
+    output gain and auto gain, which no preset sets). The phase mode is the exception: it changes the reported
+    latency, so a recall keeps whatever `values` holds for it (presets shape the tone, not the latency).
+    Returns false (values untouched) for an index outside 0 .. numPresets - 1. */
 inline bool applyPreset (int index, ParamValues& values) noexcept
 {
     if (index < 0 || index >= numPresets)
         return false;
 
     const Preset& p = factoryPresets[index];
+    const float phaseMode = values.get (paramPhaseMode);
     values.setDefaults();
+    values.set (paramPhaseMode, phaseMode);
     for (int i = 0; i < p.numParams; ++i)
         values.set (p.params[i].index, p.params[i].value);
     return true;

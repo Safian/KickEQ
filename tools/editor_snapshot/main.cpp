@@ -19,7 +19,7 @@
 
 // kickeq_editor_snapshot - renders the KickEQ editor offscreen to PNG files.
 //
-//   kickeq_editor_snapshot [OUTPUT_DIR] [--check] [--ms] [--bypass] [--hover BAND] [--prefix NAME]
+//   kickeq_editor_snapshot [OUTPUT_DIR] [--check] [--ms] [--bypass] [--phase MODE] [--hover BAND] [--prefix NAME]
 //
 // Instantiates the processor and its editor without any window, loads a multi-band setting, pushes one second of
 // pink-ish noise through processBlock so that the analyser has data, drives the editor's 30 Hz refresh by hand and
@@ -28,6 +28,7 @@
 // not blank (used as a ctest smoke test); the exit code is non-zero on failure.
 //   --ms       mid/side demo: bands 4 and 5 on Mid / Side, curve view Mid
 //   --bypass   bypass on (the curve is dimmed)
+//   --phase N  phase mode 0..3 (Minimum / Linear 2048 / 4096 / 8192; ignored when the core has no linear phase)
 //   --hover N  highlight band N (1..8) like a hovering mouse (default 4)
 //   --prefix   file name prefix (default "editor")
 
@@ -66,7 +67,7 @@ struct PinkNoise
     }
 };
 
-kickeq::ParamValues demoSetting (bool midSide, bool bypass)
+kickeq::ParamValues demoSetting (bool midSide, bool bypass, int phase)
 {
     using namespace kickeq;
     ParamValues v;
@@ -94,6 +95,7 @@ kickeq::ParamValues demoSetting (bool midSide, bool bypass)
         v.set (5, BandParam::place, static_cast<float> (Placement::left));
     }
     v.set (paramBypass, bypass ? 1.0f : 0.0f);
+    v.set (paramPhaseMode, static_cast<float> (phase));
     return v;
 }
 
@@ -114,7 +116,7 @@ int main (int argc, char** argv)
 
     juce::File outDir = juce::File::getCurrentWorkingDirectory();
     bool check = false, midSide = false, bypass = false;
-    int hover = 3;
+    int hover = 3, phase = 0;
     juce::String prefix = "editor";
     for (int i = 1; i < argc; ++i)
     {
@@ -124,6 +126,8 @@ int main (int argc, char** argv)
             midSide = true;
         else if (std::strcmp (argv[i], "--bypass") == 0)
             bypass = true;
+        else if (std::strcmp (argv[i], "--phase") == 0 && i + 1 < argc)
+            phase = juce::jlimit (0, kickeq::numPhaseModes - 1, std::atoi (argv[++i]));
         else if (std::strcmp (argv[i], "--hover") == 0 && i + 1 < argc)
             hover = juce::jlimit (1, kickeq::numBands, std::atoi (argv[++i])) - 1;
         else if (std::strcmp (argv[i], "--prefix") == 0 && i + 1 < argc)
@@ -143,7 +147,7 @@ int main (int argc, char** argv)
     KickEQProcessor processor;
     processor.setPlayConfigDetails (2, 2, sampleRate, blockSize);
     processor.prepareToPlay (sampleRate, blockSize);
-    processor.applyValues (demoSetting (midSide, bypass));
+    processor.applyValues (demoSetting (midSide, bypass, phase));
 
     std::unique_ptr<juce::AudioProcessorEditor> base (processor.createEditor());
     auto* editor = dynamic_cast<KickEQEditor*> (base.get());

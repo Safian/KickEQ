@@ -33,7 +33,8 @@ Consequences, which drive the whole design:
 
 ```
 core/                 kickeq_core        STATIC, C++17, no dependencies            (portable everywhere)
-  include/kickeq/     params.h  biquad.h  eq_engine.h  eq_curve.h  analyzer.h  fft.h  state.h  presets.h
+  include/kickeq/     params.h  biquad.h  eq_engine.h  eq_curve.h  analyzer.h  fft.h  state.h  presets.h  config.h
+                      linear_phase.h  design_thread.h                               (linear-phase mode, section 4.7)
   src/
   tests/              unit tests (ctest, own minimal runner, no framework dependency)
 clap/                 kickeq_clap_native native CLAP shell over the core; STATIC + MODULE (.clap)
@@ -98,7 +99,16 @@ Global:
 | 0 | `bypass` | bool | | off |
 | 1 | `out_gain` | float dB | -24 .. +24 | 0 |
 | 2 | `auto_gain` | bool | | off |
-| 3 | reserved: `phase_mode` (Minimum / Linear), see §4.7 | | | |
+| 3 | `phase_mode` | enum | Minimum, Linear 2048, Linear 4096, Linear 8192 (§4.7) | Minimum |
+
+`phase_mode` is the one parameter that is **not automatable** (`CLAP_PARAM_IS_STEPPED | CLAP_PARAM_IS_ENUM`, no
+`CLAP_PARAM_IS_AUTOMATABLE`): it changes the reported latency. Its table index equals its id, so the band parameters moved
+from index 3 + 7 b + k to 4 + 7 b + k (ids are unchanged); the table has 60 entries. A state blob without id 3 loads as
+Minimum. Presets do not set it and a preset recall keeps the current mode (it must not change the latency of a running
+plugin). Text labels are the plain "Minimum" / "Linear 2048" / ... (the editor shows the latency in ms next to the box, which
+needs the sample rate). When the core is built without `KICKEQ_LINEAR_PHASE` the parameter stays in the table (ids and state
+layout do not depend on the build option) but every shell reports it hidden and read-only, and its value is forced to Minimum
+(`clampParam`, so state loads, host writes and presets all end up at Minimum).
 
 8 bands; band `b` (0..7) uses ids `0x100 + 0x10*b + k`:
 
@@ -159,7 +169,10 @@ Each section keeps independent state per channel (L, R, M, S as needed).
 * Band enable/disable and type changes crossfade over 20 ms by running the section's output into a
   wet/dry mix of that band (the filter state is zeroed only when it is fully off).
 * Bypass is a 20 ms linear cross-fade between processed and dry signal [done in the spike]; in linear-phase
-  mode the dry path is delayed by the reported latency.
+  mode the dry path is delayed by the reported latency (the cross-fade is between the convolver output and the input
+  delayed by exactly N / 2 samples; bypassed at rest the output is that delayed input, bit-exact). In linear-phase
+  mode the 30 ms smoothing of the band parameters is not used: the design thread's kernel sequence is the smoothing
+  (output gain and auto gain are smoothed as before, after the convolution).
 * Block size independence: `process(n)` may be called with any `n >= 0` and any alignment; internal chunking
   uses a preallocated scratch of fixed size.
 
@@ -194,22 +207,75 @@ evaluates the cascade analytically at arbitrary frequencies. It is the single so
 auto-gain, linear-phase IR design, and the unit tests (the biquad itself is verified against it by running
 sine sweeps).
 
-### 4.7 Linear phase (optional, `KICKEQ_LINEAR_PHASE`)
+### 4.7 Linear phase (optional, `KICKEQ_LINEAR_PHASE`) [done]
 
-Parameter 3 `phase_mode` (Minimum / Linear) is reserved. Specification for the implementation:
+Parameter 3 `phase_mode` (Minimum / Linear 2048 / Linear 4096 / Linear 8192). `N` = 2048 / 4096 / 8192 is the FIR length;
+the latency is **exactly `N / 2` samples** (1024 / 2048 / 4096 = 21 / 43 / 85 ms at 48 kHz, 0 in Minimum), whatever the host
+block size is. Files: `linear_phase.h/.cpp` (designer, kernel mailbox, convolver), `design_thread.h/.cpp` (worker thread).
 
-* Target magnitude `|H(f)|` from §4.6 on the FFT grid, zero phase -> IFFT -> shift by `N/2` -> window
-  (Blackman) -> FIR of length `N`. `N` = 2048 / 4096 / 8192 (quality), latency `N/2` samples (21 / 43 / 85
-  ms at 48 kHz), reported with `clap.latency` and `clap_host_latency.changed()` followed by a restart
-  request, as required by the CLAP spec.
-* Uniform-partitioned FFT convolution (overlap-save), all buffers preallocated in `prepare()`.
-* IR recomputation happens **off the audio thread** (worker owned by the shell: JUCE thread / `clap.thread-pool`
-  or a dedicated thread; on the MPC a single low-priority thread), handed over through a lock-free
-  triple buffer; the audio thread cross-fades between the old and the new convolver output over one block.
-* M/S placements are supported by running the convolution on L/R, M/S as in §4.4.
-* The feature is gated by a CMake option; it is `OFF` for the MPC build until the CPU benchmark shows it
-  fits, and the parameter is then reported as `CLAP_PARAM_IS_HIDDEN | CLAP_PARAM_IS_READONLY`.
-* Offline rendering (`clap.render` offline) selects the highest quality.
+* **Kernel design** (`LinearPhaseDesigner`, off the audio thread, allocates only in its constructor, deterministic). The
+  analytic responses of §4.6 are evaluated for every placement (Stereo, Left, Right, Mid, Side) on a `2N` point frequency
+  grid (twice the FIR length: no time aliasing of the zero-phase response) and combined to the 2x2 matrix of the signal flow
+  of §4.4, all magnitudes real, zero phase:
+  `M(f) = Dec diag(|Hm|, |Hs|) Enc diag(|Hl| |Hst|, |Hr| |Hst|)`, i.e. `LL = a Hl Hst`, `LR = b Hr Hst`, `RL = b Hl Hst`,
+  `RR = a Hr Hst` with `a = (|Hm| + |Hs|) / 2`, `b = (|Hm| - |Hs|) / 2`. Without a Mid / Side band `LR = RL = 0` and only two
+  kernels exist. IFFT (core `fft.h`, which gained an inverse) -> real, even impulse response -> cut to `2c + 1` taps around the
+  centre tap `c = N / 2 - B` -> Blackman window (exactly 0 at both ends) -> partition spectra. A set whose bins are all within
+  -140 dB of "pure delay" is flagged `identity`. Output gain and auto gain are not part of the kernels (the engine applies
+  them after the convolution, smoothed as in minimum phase).
+* **Convolver** (`PartitionedConvolver`): uniform-partitioned overlap-save, block `B = 128`, FFT size 256, `P = N / B - 2`
+  partitions (14 / 30 / 62) of 128 taps; the spectra of the last `P` input segments are kept per input channel. All buffers
+  (up to N = 8192) are allocated in the constructor, so a mode switch never allocates.
+* **Latency scheme.** A block can only be convolved when its last sample has arrived, so output block `k` is emitted while
+  input block `k + 1` is received: every tap `j` is delayed by `B + j`. The FIR therefore has its centre tap at
+  `c = N / 2 - B`; `B + c = N / 2` exactly. The convolver counts samples, not host calls, so the latency does not depend
+  on the host block size (tests: impulse at sample 0 returns at sample `N / 2` for block sizes 1, 7, 128 and 4096). The
+  Blackman window is zero at both ends, so only taps `1 .. 2c - 1` are non-zero: the cost is a window 2B = 256 taps shorter
+  than N (12 % of the resolution at N = 2048, 3 % at N = 8192). An `identity` kernel set is realised as a copy of the input
+  history at `N / 2` samples back instead of an FFT convolution: a flat linear-phase EQ is bit-transparent (the output is the
+  input delayed by `N / 2` samples). The same delayed copy is the dry signal of the bypass cross-fade. Without a kernel set
+  (before the first design arrived) the convolver is that pure delay as well.
+* **Kernel hand-over.** `DesignLink` carries parameter snapshots from the audio thread to the design thread through a
+  sequence lock over relaxed atomics (single producer, wait-free; `requestSequence` is the number of requests so far);
+  `KernelMailbox` carries finished `KernelSet`s back through four slots and one atomic index (writer: one slot, mailbox:
+  one, reader: the set in use plus the previous one for the cross-fade). The audio thread fetches at the 128-sample block
+  boundaries and cross-fades the old and the new result linearly over that block (both are computed from the same input
+  spectra, so no second convolver state is needed). Sets are stamped with the request sequence, mode and sample rate;
+  sets that do not match the running mode or rate are dropped.
+* **Threads.** The core creates none; the engine only posts requests (`EqEngine::designLink`, `requestDesign`,
+  `paramSequence`, `appliedKernelSequence`) and `EqEngine::designSynchronously` is the single-thread reference for tests and
+  offline use. `DesignThread` (`std::thread` + condition variable; works on iOS and Android too) is owned by the shell:
+  started after `prepare`, stopped before the next `prepare` / destruction, parked while the mode is Minimum (no polling),
+  at least 12 ms between two designs while parameters move (leading edge immediate, trailing edge within 12 ms), low priority
+  (nice 10 on Linux/Android, QoS utility on Apple, below-normal on Windows). A design of an 8 band set at N = 4096 takes
+  ~0.5 ms on an Apple M-series core (`kickeq_bench` prints it).
+* **Mode switching while running.** The engine keeps both paths for the time of a change: Minimum -> Linear starts the
+  convolver, keeps the biquads running for `N / 2` samples (the warm-up of the new path) and then cross-fades over 20 ms;
+  Linear -> Minimum builds the biquads at once and cross-fades over 20 ms; a change of N goes through Minimum. The reported
+  latency follows the parameter immediately; the host is expected to restart the plugin (below), the audio is continuous
+  meanwhile.
+* **Tail** = the minimum-phase tail estimate of the enabled bands plus `N` samples (the delay line and the FIR).
+* **Accuracy.** The magnitude of the whole EQ equals the analytic minimum-phase curve to within 0.15 dB between
+  `4 sr / N` and `0.4 sr` for smooth features (bell, shelves, 12 dB/oct cuts, notch, band pass at least 12 bins = `12 sr / N`
+  wide). The windowed FIR cannot follow what changes faster than the main lobe of the window (+- 3 bins): the skirts of steep cuts
+  and the centre of a notch are compared only above -24 dB in the tests, steep (36 .. 48 dB/oct) cut corners are tested at >= 40 .. 90
+  bins. Mid / Side bands use the magnitude matrix above, which differs by up to ~0.2 dB from the complex sums of the
+  minimum-phase flow for strongly different Mid and Side bands (Stereo, Left and Right bands are exact).
+* **Build option.** `KICKEQ_LINEAR_PHASE` (CMake, default ON). OFF: the convolver, the designer and the thread are not
+  compiled, the engine is the plain minimum-phase engine, `phase_mode` is hidden + read-only in every shell and forced to
+  Minimum on load. The ARMv7 toolchain file (`cmake/toolchains/armv7-linux-gnueabihf.cmake`) defaults it to OFF until the MPC
+  benchmark exists (`-DKICKEQ_LINEAR_PHASE=ON` on the command line builds it there; the bench scenarios and the QEMU timings
+  are recorded in section 9).
+* **Shells.** Native CLAP: the design thread starts in `activate`, stops in `deactivate`; a `phase_mode` event (audio thread,
+  or `params.flush`, which cannot tell its thread) only raises a flag and `host->request_callback`; in `on_main_thread` (and
+  directly on state load) the plugin wakes the thread and, while activated, calls `request_restart`. CLAP allows
+  `clap_host_latency.changed` only inside `activate` (clap-validator enforces it), so that is where it is called, when
+  the mode differs from the previous activation. `clap.latency.get` returns `N / 2` of the running configuration while
+  activated and of the stored mode otherwise. JUCE: a listener on the parameter applies the mode on the message thread (`setLatencySamples`, which tells the VST3 host
+  `kLatencyChanged` and makes the CLAP wrapper request a restart and call `latency.changed` on the next activate), the design
+  thread runs from `prepareToPlay` to `releaseResources`. The editor has a Phase box in the toolbar with the latency in ms;
+  the curve is unchanged (the magnitude is identical by design). Offline rendering (`clap.render`) only disables the analyser:
+  the latency must not depend on the render mode.
 
 ### 4.8 Oversampling
 
@@ -274,14 +340,14 @@ on phones.
 ### 6.1 JUCE shell implementation notes (as built)
 
 * **Parameters** are generated from `kickeq::paramTable` (`juce/CoreParameter.h`), strId as `ParameterID` version 1,
-  the three global parameters at the top level and every band as a parameter group (CLAP module / VST3 unit
+  the four global parameters at the top level and every band as a parameter group (CLAP module / VST3 unit
   "Band N"). `CoreParameter` is a `RangedAudioParameter` whose `NormalisableRange` calls the core's
   `toNormalized` / `fromNormalized`; text is the core's `valueToText` / `textToValue`. It keeps the **plain value**
   in an atomic instead of the stock float normalised value, so a state blob loads with bit-identical values (the
   audio thread reads exactly what the native shell reads) and a host echoing the normalised value does not move it.
   The bypass parameter is the host bypass parameter.
 * **Processor**: `EqEngine` (heap, once) fed from the parameter atomics at the start of each block; stereo and
-  mono (`isBusesLayoutSupported`: stereo, or mono <-> mono); `ScopedNoDenormals`; tail from the engine; latency 0;
+  mono (`isBusesLayoutSupported`: stereo, or mono <-> mono); `ScopedNoDenormals`; tail from the engine; latency from `phase_mode` (§4.7);
   the analyser is fed only while an editor holds it (`acquireAnalyzer` / `releaseAnalyzer`).
 * **State** is the core blob (not APVTS XML). The `UI01` chunk is 5 bytes (`juce/EditorSettings.h`): layout version
   1, analyser source, analyser range index, slope compensation index, curve range index; anything missing or out of
@@ -295,8 +361,9 @@ on phones.
 * **Editor** (`juce/Editor*.{h,cpp}`): `EqCanvas` (grid and labels cached in an `Image` per size / scale / range,
   curve paths rebuilt only when the parameters, view, sample rate or size change, analyser paths per frame),
   `BandPanel` (chips + attached controls), `KickEQEditor` (30 Hz timer: `process()` + `pull()`, curve refresh,
-  control sync). Global controls sit in a header bar and the analyser / curve selectors in a toolbar above the canvas
-  (not in the bottom strip) so that everything stays legible at the 720 x 420 minimum.
+  control sync). Global controls sit in a header bar and the analyser / curve selectors and the Phase box (with the
+  latency in ms) in a toolbar above the canvas (not in the bottom strip) so that everything stays legible at the 720 x 420
+  minimum.
 
 ## 7. CLAP integration (native shell and JUCE shell)
 
@@ -305,9 +372,9 @@ on phones.
 | `clap.audio-ports` | 1 stereo in, 1 stereo out, in-place allowed; `audio-ports-config` adds mono<->mono |
 | `clap.params` | all of §3, with `get_info`, `value_to_text`, `text_to_value`, `flush`; events processed with sample-accurate splitting (64-sample grid) |
 | `clap.state` | the versioned blob of §8, main thread only |
-| `clap.latency` | 0 in minimum-phase mode; `N/2` in linear-phase mode (§4.7) |
+| `clap.latency` | 0 in minimum-phase mode; `N/2` in linear-phase mode (§4.7); a change of `phase_mode` while activated calls `request_restart`, `clap_host_latency.changed` is called inside `activate` when the latency differs from the previous activation |
 | `clap.tail` | decay time of the slowest active section: `min(10 s, 13.8 * Q / (pi * f))`, updated with `clap_host_tail.changed` when parameters change |
-| `clap.render` | `offline` -> analyser off, highest linear-phase quality; `realtime` default |
+| `clap.render` | `offline` -> analyser off (the latency does not depend on the render mode); `realtime` default |
 | `clap.remote-controls` | band pages for the MPC Q-Links (§3.2) |
 | `clap.preset-discovery` | factory presets (§8.2) |
 | `clap.thread-check` | used for debug assertions when offered |
@@ -349,6 +416,7 @@ QEMU for regression, and is run by the owner on the MPC hardware):
 | MPC ARMv7, 48 kHz, 128 frames | 8 bands active (2 cuts at 24 dB/oct), stereo, analyser disabled, parameters at rest | <= 3 % of one core |
 | same, all parameters moving | | <= 6 % of one core |
 | Mid-range phone (arm64) | same | <= 1 % of one core |
+| any, 48 kHz, 128 frames | linear phase, N = 4096, 8 bands, at rest and while moving (`kickeq_bench`, `process` calls only; the design thread runs on another core) | reported only: no budget is defined yet |
 
 Back-of-envelope: 14 sections x 2 channels x 48 k samples/s x ~10 flops = 13 Mflop/s; the ARMv7 VFP at
 ~1 GHz handles that with a large margin. The measurement replaces this estimate.
@@ -378,7 +446,7 @@ Platform keys: `linux-armv7`, `linux-aarch64`, `linux-x86_64`, `macos-universal`
 ### 11.1 CMake options
 
 `KICKEQ_BUILD_JUCE` (default ON on macOS/Windows/Linux-desktop), `KICKEQ_BUILD_CLAP_NATIVE` (ON),
-`KICKEQ_BUILD_TESTS` (ON), `KICKEQ_LINEAR_PHASE`, `KICKEQ_SANITIZE`. JUCE is fetched only when the JUCE
+`KICKEQ_BUILD_TESTS` (ON), `KICKEQ_LINEAR_PHASE` (ON; OFF by default for ARMv7), `KICKEQ_SANITIZE`. JUCE is fetched only when the JUCE
 shell is enabled. Static-only configuration (`-DKICKEQ_BUILD_JUCE=OFF`) needs just a C++17 compiler and
 CMake and is what the cross builds use.
 
@@ -393,6 +461,15 @@ CMake and is what the cross builds use.
     rates 8 kHz .. 384 kHz: finite output, bounded.
   * No NaN/Inf/denormal on silence, impulses, DC, full-scale noise, and NaN/Inf *input* (output sanitised).
   * Block-size independence (1, 7, 32, 64, 127, 4096 frames give identical output).
+  * **Linear phase** (`test_linear_phase.cpp`, `alloc_test.cpp`, `thread_test.cpp`): FFT inverse; kernel mailbox and design
+    link; designer determinism, tap symmetry, flat-set detection; latency exactly N / 2 for block sizes 1, 7, 128, 4096;
+    constant group delay N / 2 (phase error < 1e-3 rad); flat EQ bit-identical to the input delayed by N / 2; magnitude vs the
+    analytic curve (44.1 / 48 / 96 kHz, all N, all band types); partitioned convolver vs direct convolution; Mid / Side / Left /
+    Right placements vs an explicit matrix; block-size independence; bypass with the delayed dry; mode switching and
+    parameter sweeps without clicks; reset and sample-rate change; `DesignThread` end to end; **no allocation on the audio
+    side** (global `operator new` replaced in `kickeq_linear_alloc_test`, counted while `process` runs through mode
+    switches and kernel hand-overs); mailbox / seqlock / engine stress with real threads (`kickeq_linear_thread_test`, also
+    run under ThreadSanitizer by hand).
   * Smoothing: no click above -60 dBFS jumps when a parameter steps; M/S flow equals an explicit matrix
     reference; auto-gain on pink noise within 0.5 dB.
   * FFT vs naive DFT, analyser SPSC ring under a producer/consumer stress, state round-trip and fuzzed blobs.
@@ -429,5 +506,5 @@ QEMU timings are only used for regression, never as an absolute figure.
 | JUCE shell on the core + editor (`juce/`), `kickeq_editor_snapshot`, JUCE-profile conformance, cross-shell bit-exactness | **[done]** (macOS arm64; see section 6.1) |
 | Presets | planned |
 | CI matrix (incl. ARMv7/QEMU, iOS/Android) | planned |
-| Linear phase | designed (§4.7), implementation after the CPU benchmark |
+| Linear phase (`phase_mode`, designer, convolver, design thread, shells, editor box, tests) | **[done]** (§4.7); the MPC build keeps it OFF until the hardware benchmark |
 | MPC hardware benchmark | needs the device |

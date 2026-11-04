@@ -21,6 +21,10 @@ shells run the same portable DSP core, so they render bit-identical audio for th
 - RBJ biquads with exactly pre-warped centre frequency, double precision, Butterworth cascades for the cuts;
   parameter changes are smoothed over 30 ms (coefficients recomputed every 32 samples while something moves);
   block-size independent, no allocation or locks on the audio thread, mono and stereo
+- **Linear-phase mode** (optional, parameter `phase_mode`: Minimum / Linear 2048 / 4096 / 8192): the same EQ as a
+  symmetric FIR (partitioned FFT convolution, kernels designed on a low-priority thread), latency exactly N / 2 samples
+  (21 / 43 / 85 ms at 48 kHz), reported to the host; not automatable (a change asks the host to restart the plugin);
+  built with `KICKEQ_LINEAR_PHASE` (default ON, OFF for the MPC / ARMv7 toolchain until it is benchmarked there)
 - **Spectrum analyser** (4096-point FFT, pre and post, source L+R / Mid / Side) drawn by the editor
 
 ### Editor (JUCE shell)
@@ -34,7 +38,7 @@ Resizable (720 x 420 minimum, 960 x 560 default), HiDPI, dark theme, software re
   **double-click** on empty canvas adds the first disabled band, double-click on a node or **Delete** disables it,
   **right-click** = type / slope / placement menu; hovering a node highlights the frequency range the band acts on
 - Bottom strip: band chips plus the controls of the selected band; header: preset menu, bypass, auto gain, output
-  gain. Every edit goes through JUCE parameter attachments, so a DAW records automation touch / release correctly
+  gain; toolbar: the Phase box (Minimum / Linear 2048 / 4096 / 8192) with the latency in ms. Every edit goes through JUCE parameter attachments, so a DAW records automation touch / release correctly
 - Analyser source / range, slope compensation and curve range are editor state, saved in the `UI01` chunk of the
   plugin state (not automatable parameters)
 
@@ -93,6 +97,7 @@ cmake --build build --parallel
 | `KICKEQ_BUILD_TOOLS` | ON | `clap_testhost`, `kickeq_bench` (needs the native shell) |
 | `KICKEQ_BUILD_TESTS` | ON | register the tests with CTest |
 | `KICKEQ_BUILD_EDITOR_SNAPSHOT` | ON (OFF on Linux) | `kickeq_editor_snapshot`, the offscreen editor renderer (JUCE on Linux wants a display) |
+| `KICKEQ_LINEAR_PHASE` | ON (OFF with the ARMv7 toolchain file) | linear-phase mode: `phase_mode` parameter, FFT convolver, design thread. OFF removes it from the engine; the parameter stays in the table, hidden and read-only |
 | `KICKEQ_SANITIZE` | OFF | AddressSanitizer + UndefinedBehaviorSanitizer for the core and its tests |
 | `KICKEQ_CODESIGN_IDENTITY` | `-` | macOS: codesign identity of the bundles (`-` = ad hoc) |
 
@@ -130,7 +135,8 @@ ctest --test-dir build -R cross_shell           # bit-exactness JUCE shell vs na
 |------|------|
 | `kickeq_core_tests` | unit tests of the core (filter responses, null test, extremes, block-size independence, smoothing, M/S, auto gain, FFT, analyser, state fuzzing, presets) |
 | `clap_testhost_static`, `clap_testhost_dynamic` | CLAP conformance of the native shell (static factory and `dlopen`) against the core engine, bit-exact |
-| `kickeq_bench_check` | CPU benchmark regression guard |
+| `kickeq_linear_alloc_test`, `kickeq_linear_thread_test` | linear phase: no heap allocation on the audio side (global `operator new` counting, through mode switches and kernel hand-overs); mailbox / seqlock / engine stress with real threads (run it under ThreadSanitizer too: `-DCMAKE_CXX_FLAGS=-fsanitize=thread`) |
+| `kickeq_bench_check` | CPU benchmark regression guard (the linear-phase scenarios are reported only) |
 | `clap_testhost_juce` | the same conformance suite against the JUCE CLAP (`--juce` profile: the places where the wrapper legitimately differs are listed at the top of `tools/clap_testhost/conformance.cpp`) |
 | `cross_shell_*` | the fixed baseline state and 5 s of noise at 44.1 and 48 kHz through both CLAPs must be **bit-identical**; a state blob saved by one shell loads into the other with bit-identical parameter values |
 | `kickeq_juce_shell_test` | the JUCE processor directly: parameters from the core table, bus layouts (stereo, mono), mono audio, programs, state and `UI01` chunk, host notification, analyser hook |

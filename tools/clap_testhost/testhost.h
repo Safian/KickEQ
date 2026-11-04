@@ -90,7 +90,7 @@ public:
     explicit TestHost (bool offerExtensions = true);
     const clap_host_t* get() const { return &host; }
 
-    std::atomic<int> callbackRequests { 0 }, tailChanged { 0 }, latencyChanged { 0 }, paramsRescan { 0 },
+    std::atomic<int> callbackRequests { 0 }, restartRequests { 0 }, tailChanged { 0 }, latencyChanged { 0 }, paramsRescan { 0 },
         presetLoaded { 0 }, presetErrors { 0 }, logTotal { 0 }, logErrors { 0 }, mainChecks { 0 }, audioChecks { 0 },
         violations { 0 }, outEventsPushed { 0 };
     std::thread::id mainId;
@@ -185,8 +185,9 @@ std::vector<float> makeNoise (size_t n, uint32_t seed);
 bool bitEqual (const std::vector<float>& a, const std::vector<float>& b, size_t* firstDiff = nullptr);
 bool allFinite (const std::vector<float>& a);
 
-/** The fixed state used for the cross-shell baseline (every band on, all types / placements, auto gain). */
-std::vector<uint8_t> baselineState();
+/** The fixed state used for the cross-shell baseline (every band on, all types / placements, auto gain) in the given
+    phase mode (0 = minimum phase, 1..3 = linear phase 2048 / 4096 / 8192). */
+std::vector<uint8_t> baselineState (int phaseMode = 0);
 
 // conformance.cpp
 struct Options

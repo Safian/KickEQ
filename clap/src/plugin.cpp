@@ -26,6 +26,15 @@
 //   audio thread  : process (and params.flush while the plugin is active), reset.
 // Shared state between them: the parameter values (std::atomic<float> per parameter, plain values), the
 // tail length, the "render offline" flag and the analyser pointer. Everything else belongs to one thread.
+//
+// Linear phase (ARCHITECTURE.md section 4.7): while activated and in a linear mode the plugin runs a DesignThread
+// that designs the FIR kernels for the engine (no thread exists in minimum phase). The reported latency is N / 2 samples of the phase_mode parameter, which is not
+// automatable. CLAP only allows the latency to change inside activate (): the plugin calls
+// clap_host_latency.changed () there when the mode differs from the one of the previous activation, and when the mode
+// changes while activated (state load, preset, host parameter edit, or an event on the audio thread) it asks the host
+// for a restart with request_restart (): the audio thread only raises a flag and asks for a main thread callback, the
+// rest happens in on_main_thread. clap.latency.get reports the configuration that is running while activated. The
+// engine cross-fades to the new path meanwhile, so the audio stays sensible until the host has restarted the plugin.
 
 #include "plugin.h"
 
@@ -42,10 +51,15 @@
 
 #include "kickeq/analyzer.h"
 #include "kickeq/clap_analyzer.h"
+#include "kickeq/config.h"
 #include "kickeq/eq_engine.h"
 #include "kickeq/params.h"
 #include "kickeq/presets.h"
 #include "kickeq/state.h"
+
+#if KICKEQ_LINEAR_PHASE
+#include "kickeq/design_thread.h"
+#endif
 
 #include "denormals.h"
 
@@ -193,6 +207,12 @@ private:
             shared[i].store (v.get (i), std::memory_order_relaxed);
     }
 
+    /** The phase mode (0 = minimum, 1..3 = linear 2048 / 4096 / 8192) as currently stored. Any thread. */
+    int currentMode() const noexcept
+    {
+        return static_cast<int> (clampParam (paramInfo (paramPhaseMode), shared[paramPhaseMode].load (std::memory_order_relaxed)));
+    }
+
     /** Parameter value event from the host (audio thread, or flush). Unknown ids are ignored. */
     void storeParamEvent (const clap_event_param_value_t& ev, ParamValues* audioCopy) noexcept
     {
@@ -203,6 +223,61 @@ private:
         shared[idx].store (v, std::memory_order_relaxed);
         if (audioCopy != nullptr)
             audioCopy->values[static_cast<size_t> (idx)] = v;
+        if (idx == paramPhaseMode)
+            noteModeEvent();
+    }
+
+    /** A phase_mode value arrived from the host (process or params.flush: the calling thread is the audio thread or
+        the main thread, the plugin cannot tell). Only a flag and the thread safe request_callback are used; the work
+        happens in on_main_thread. */
+    void noteModeEvent() noexcept
+    {
+        const int mode = currentMode();
+        if (mode == lastSeenMode.exchange (mode, std::memory_order_relaxed))
+            return;
+        modeChangePending.store (true, std::memory_order_release);
+        if (host != nullptr && host->request_callback != nullptr)
+            host->request_callback (host);
+    }
+
+    /** Main thread: the stored phase mode may have changed (event, state, preset). Wakes or parks the design thread
+        and, while activated, asks the host for the restart that applies the new latency (clap_host_latency.changed
+        itself may only be called inside activate). */
+    void handleModeChange() noexcept
+    {
+        const int mode = currentMode();
+        lastSeenMode.store (mode, std::memory_order_relaxed);
+        syncDesignThread (mode);
+        if (mode != activeMode && activated && host != nullptr && host->request_restart != nullptr)
+            host->request_restart (host);
+    }
+
+    /** Main thread: the design thread exists while the plugin is activated in a linear phase mode (nothing to design in
+        minimum phase, so no thread at all there). */
+    void syncDesignThread ([[maybe_unused]] int mode) noexcept
+    {
+#if KICKEQ_LINEAR_PHASE
+        if (!activated)
+            return;
+        if (mode != 0)
+        {
+            if (!designThread.running())
+                if (DesignLink* link = engine->designLink())
+                    designThread.start (*link);
+            designThread.setActive (true);
+        }
+        else if (designThread.running())
+        {
+            designThread.stop();
+        }
+#endif
+    }
+
+    /** Latency in samples: the running configuration while activated, the stored phase mode otherwise (it is what the
+        next activation runs). Main thread (clap.latency). */
+    uint32_t latencySamples() const noexcept
+    {
+        return static_cast<uint32_t> (engine->latencyForMode (activated ? activeMode : currentMode()));
     }
 
     void handleEvent (const clap_event_header_t* h, ParamValues* audioCopy) noexcept
@@ -221,6 +296,7 @@ private:
         hostLog = hostExt<clap_host_log_t> (CLAP_EXT_LOG);
         hostParams = hostExt<clap_host_params_t> (CLAP_EXT_PARAMS);
         hostTail = hostExt<clap_host_tail_t> (CLAP_EXT_TAIL);
+        hostLatency = hostExt<clap_host_latency_t> (CLAP_EXT_LATENCY);
         hostPresetLoad = hostExt<clap_host_preset_load_t> (CLAP_EXT_PRESET_LOAD);
         if (hostPresetLoad == nullptr)
             hostPresetLoad = hostExt<clap_host_preset_load_t> (CLAP_EXT_PRESET_LOAD_COMPAT);
@@ -235,11 +311,20 @@ private:
             return false;
         rate = sampleRate;
         engine->prepare (sampleRate, static_cast<int> (maxFrames > 1u << 20 ? 1u << 20 : maxFrames));
+        const int mode = currentMode();
+        const bool latencyDiffers = mode != activeMode;
+        activeMode = mode;
+        lastSeenMode.store (mode, std::memory_order_relaxed);
+        modeChangePending.store (false, std::memory_order_relaxed);
+        // the latency of this activation differs from the one the host knows: the one place where CLAP allows changed ()
+        if (latencyDiffers && hostLatency != nullptr && hostLatency->changed != nullptr)
+            hostLatency->changed (host);
         reportedTail = 0;
         tail.store (0, std::memory_order_relaxed);
         if (SpectrumAnalyzer* a = analyzer.load (std::memory_order_acquire))
             a->prepare (sampleRate); // not processing: no concurrent push()
         activated = true;
+        syncDesignThread (mode);
         return true;
     }
 
@@ -247,6 +332,9 @@ private:
     {
         checkMainThread ("deactivate");
         activated = false;
+#if KICKEQ_LINEAR_PHASE
+        designThread.stop(); // before the engine is prepared again or destroyed
+#endif
     }
 
     bool startProcessing() noexcept
@@ -387,7 +475,12 @@ private:
         }
     }
 
-    void onMainThread() noexcept { checkMainThread ("on_main_thread"); }
+    void onMainThread() noexcept
+    {
+        checkMainThread ("on_main_thread");
+        if (modeChangePending.exchange (false, std::memory_order_acquire))
+            handleModeChange();
+    }
 
     // ----- audio ports -------------------------------------------------------------------------------------------
 
@@ -454,6 +547,8 @@ private:
             out->flags |= CLAP_PARAM_IS_ENUM;
         if (index == static_cast<uint32_t> (paramBypass))
             out->flags |= CLAP_PARAM_IS_BYPASS;
+        if ((p.flags & flagNeedsLinearPhase) != 0 && !linearPhaseOn())
+            out->flags |= CLAP_PARAM_IS_HIDDEN | CLAP_PARAM_IS_READONLY; // not built in: shown nowhere, never written
         out->cookie = nullptr;
         copyString (out->name, sizeof out->name, p.name);
         copyString (out->module, sizeof out->module, p.module);
@@ -572,6 +667,7 @@ private:
             uiSize = 0;
         }
         writeShared (v);
+        handleModeChange(); // a state with another phase mode changes the latency
         // the loaded values were not set by the host: it has to re-read them
         if (hostParams != nullptr && hostParams->rescan != nullptr)
             hostParams->rescan (host, CLAP_PARAM_RESCAN_VALUES | CLAP_PARAM_RESCAN_TEXT);
@@ -606,7 +702,8 @@ private:
             copyString (out->page_name, sizeof out->page_name, "Global");
             out->page_id = 0;
             for (int i = 0; i < numGlobalParams; ++i)
-                out->param_ids[i] = paramInfo (i).id;
+                if ((paramInfo (i).flags & flagNeedsLinearPhase) == 0 || linearPhaseOn())
+                    out->param_ids[i] = paramInfo (i).id;
         }
         return true;
     }
@@ -618,6 +715,7 @@ private:
         checkMainThread ("preset-load.from_location");
         const int idx = kind == CLAP_PRESET_DISCOVERY_LOCATION_PLUGIN ? presetIndexForLoadKey (loadKey) : -1;
         ParamValues v;
+        readShared (v); // a preset keeps the phase mode (applyPreset)
         if (idx < 0 || !applyPreset (idx, v))
         {
             if (hostPresetLoad != nullptr && hostPresetLoad->on_error != nullptr)
@@ -715,8 +813,12 @@ private:
     const clap_host_params_t* hostParams = nullptr;
     const clap_host_tail_t* hostTail = nullptr;
     const clap_host_preset_load_t* hostPresetLoad = nullptr;
+    const clap_host_latency_t* hostLatency = nullptr;
 
-    std::unique_ptr<EqEngine> engine; // ~15 KB, allocated once here
+    std::unique_ptr<EqEngine> engine; // ~15 KB (+ ~1.5 MB for the linear-phase stage), allocated once here
+#if KICKEQ_LINEAR_PHASE
+    DesignThread designThread;        // declared after the engine: joined before the engine is destroyed
+#endif
 
     std::atomic<float> shared[numParams]; // plain parameter values, main <-> audio
     ParamValues audioValues;              // audio thread working copy
@@ -729,6 +831,9 @@ private:
     float pre[2][preChunk] = {};
 
     double rate = 48000.0;
+    int activeMode = 0;         // main thread: phase mode of the last activation (the latency the host compensates)
+    std::atomic<int> lastSeenMode { 0 };           // last phase mode seen in an event or applied (any thread)
+    std::atomic<bool> modeChangePending { false }; // audio -> main: handleModeChange is due
     bool activated = false;     // main thread
     uint32_t portChannels = 2;  // main thread (selected audio ports config)
 
@@ -762,7 +867,7 @@ struct ExtTables
     static bool CLAP_ABI stSave (const clap_plugin_t* p, const clap_ostream_t* o) { return s (p).stateSave (o); }
     static bool CLAP_ABI stLoad (const clap_plugin_t* p, const clap_istream_t* i) { return s (p).stateLoad (i); }
     // latency / tail
-    static uint32_t CLAP_ABI latGet (const clap_plugin_t* p) { return static_cast<uint32_t> (s (p).engine->getLatencySamples()); }
+    static uint32_t CLAP_ABI latGet (const clap_plugin_t* p) { return s (p).latencySamples(); }
     static uint32_t CLAP_ABI tailGet (const clap_plugin_t* p) { return s (p).tail.load (std::memory_order_relaxed); }
     // render
     static bool CLAP_ABI renderRealtimeOnly (const clap_plugin_t*) { return false; }

@@ -41,13 +41,17 @@ bool parse (int index, const char* s, float& out) { return textToValue (paramInf
 
 TEST (params_table_has_the_specified_shape)
 {
-    CHECK (numParams == 59);
-    CHECK (paramTable.size() == 59);
+    CHECK (numParams == 60);
+    CHECK (paramTable.size() == 60);
 
     CHECK (std::string (paramInfo (0).strId) == "bypass" && paramInfo (0).id == 0 && paramInfo (0).kind == Kind::Bool);
     CHECK (std::string (paramInfo (1).strId) == "out_gain" && paramInfo (1).id == 1 && paramInfo (1).kind == Kind::Float);
     CHECK (paramInfo (1).min == -24.0f && paramInfo (1).max == 24.0f && paramInfo (1).def == 0.0f);
     CHECK (std::string (paramInfo (2).strId) == "auto_gain" && paramInfo (2).id == 2 && paramInfo (2).kind == Kind::Bool);
+    CHECK (std::string (paramInfo (3).strId) == "phase_mode" && paramInfo (3).id == 3 && paramInfo (3).kind == Kind::Enum);
+    CHECK (std::string (paramInfo (3).module) == "Global" && paramInfo (3).def == 0.0f && paramInfo (3).numEnumLabels == 4);
+    CHECK ((paramInfo (3).flags & flagStepped) != 0 && (paramInfo (3).flags & flagAutomatable) == 0);
+    CHECK (std::string (paramInfo (3).enumLabels[0]) == "Minimum" && std::string (paramInfo (3).enumLabels[3]) == "Linear 8192");
 
     const char* const defaultNames[numBands] = { "Low Cut", "Low Shelf", "Bell", "Bell", "Bell", "Bell", "High Shelf", "High Cut" };
     const float defaultFreq[numBands] = { 30, 100, 250, 800, 2500, 6000, 10000, 18000 };
@@ -108,7 +112,8 @@ TEST (params_table_invariants)
         CHECK (p.min < p.max);
         CHECK (p.def >= p.min && p.def <= p.max);
         CHECK (p.unit != nullptr && p.module != nullptr && p.name != nullptr && p.strId != nullptr);
-        CHECK ((p.flags & flagAutomatable) != 0);
+        // phase_mode changes the reported latency: it is the one parameter that is not automatable
+        CHECK (((p.flags & flagAutomatable) != 0) == (i != paramPhaseMode));
 
         if (p.kind == Kind::Float)
         {
@@ -131,7 +136,7 @@ TEST (params_table_invariants)
         CHECK (indexOfStrId (p.strId) == i);
     }
 
-    CHECK (indexOfId (3) == -1); // phase_mode is reserved, absent for now
+    CHECK (indexOfId (3) == paramPhaseMode);
     CHECK (indexOfId (4) == -1);
     CHECK (indexOfId (0xFF) == -1);
     CHECK (indexOfId (0x0FF) == -1);
@@ -186,6 +191,8 @@ TEST (params_normalised_scaling)
     for (int i = 0; i < numParams; ++i)
     {
         const ParamInfo& p = paramInfo (i);
+        if ((p.flags & flagNeedsLinearPhase) != 0 && !linearPhaseOn())
+            continue; // a build without linear phase pins phase_mode to its default (checked in params_phase_mode_*)
         CHECK_NEAR (toNormalized (p, p.min), 0.0, 1.0e-6);
         CHECK_NEAR (toNormalized (p, p.max), 1.0, 1.0e-6);
         CHECK (fromNormalized (p, 0.0f) == p.min);
@@ -370,4 +377,28 @@ TEST (params_text_round_trip_for_every_parameter)
             CHECK_NEAR (back, clamped, tol);
         }
     }
+}
+
+TEST (params_phase_mode_helpers_labels_and_text)
+{
+    CHECK (phaseModeLength (0) == 0 && phaseModeLength (1) == 2048 && phaseModeLength (2) == 4096 && phaseModeLength (3) == 8192);
+    CHECK (phaseModeLength (-1) == 0 && phaseModeLength (4) == 0);
+    CHECK (phaseModeLatency (0) == 0 && phaseModeLatency (1) == 1024 && phaseModeLatency (2) == 2048 && phaseModeLatency (3) == 4096);
+
+    const ParamInfo& pm = paramInfo (paramPhaseMode);
+    CHECK (text (paramPhaseMode, 0.0f) == "Minimum");
+    CHECK (text (paramPhaseMode, 2.0f) == "Linear 4096" || !linearPhaseOn());
+    float v = -1.0f;
+    CHECK (textToValue (pm, "linear 8192", v) && v == 3.0f); // the parse result; clamping happens when it is stored
+    CHECK (textToValue (pm, "minimum", v) && v == 0.0f);
+    CHECK (!textToValue (pm, "linear 1024", v));
+
+    ParamValues pv;
+    CHECK (pv.phaseMode() == 0);
+    pv.set (paramPhaseMode, 2.0f);
+    CHECK (pv.phaseMode() == (linearPhaseOn() ? 2 : 0)); // a build without the feature forces Minimum
+    pv.set (paramPhaseMode, 9.0f);
+    CHECK (pv.phaseMode() == (linearPhaseOn() ? 3 : 0));
+    pv.set (paramPhaseMode, 1.4f);
+    CHECK (pv.phaseMode() == (linearPhaseOn() ? 1 : 0));
 }
