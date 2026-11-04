@@ -271,6 +271,33 @@ on phones.
   Wayland); the editor then opens floating or falls back to the host's generic UI. Platforms without
   `clap.gui` support (MPC, mobile) never load this layer.
 
+### 6.1 JUCE shell implementation notes (as built)
+
+* **Parameters** are generated from `kickeq::paramTable` (`juce/CoreParameter.h`), strId as `ParameterID` version 1,
+  the three global parameters at the top level and every band as a parameter group (CLAP module / VST3 unit
+  "Band N"). `CoreParameter` is a `RangedAudioParameter` whose `NormalisableRange` calls the core's
+  `toNormalized` / `fromNormalized`; text is the core's `valueToText` / `textToValue`. It keeps the **plain value**
+  in an atomic instead of the stock float normalised value, so a state blob loads with bit-identical values (the
+  audio thread reads exactly what the native shell reads) and a host echoing the normalised value does not move it.
+  The bypass parameter is the host bypass parameter.
+* **Processor**: `EqEngine` (heap, once) fed from the parameter atomics at the start of each block; stereo and
+  mono (`isBusesLayoutSupported`: stereo, or mono <-> mono); `ScopedNoDenormals`; tail from the engine; latency 0;
+  the analyser is fed only while an editor holds it (`acquireAnalyzer` / `releaseAnalyzer`).
+* **State** is the core blob (not APVTS XML). The `UI01` chunk is 5 bytes (`juce/EditorSettings.h`): layout version
+  1, analyser source, analyser range index, slope compensation index, curve range index; anything missing or out of
+  range falls back to the defaults. A blob from the native shell (no chunk) loads with default editor settings.
+  Factory presets are the JUCE programs; `getCurrentProgram` reports the preset whose values equal the parameters.
+* **CLAP wrapper**: built with `CLAP_PROCESS_EVENTS_RESOLUTION_SAMPLES 64` and `CLAP_USE_JUCE_PARAMETER_RANGES ALL`
+  (hosts see Hz / dB / enum indices, not 0..1). The wrapper does not split a block exactly at a parameter event but
+  in sub-blocks that are multiples of 64 samples (the events inside a sub-block are applied at its start), and it
+  passes event values through a float normalised number; the conformance profile (`clap_testhost --juce`) reproduces
+  that rule for its reference engine. Without events the JUCE CLAP is bit-identical to the native CLAP.
+* **Editor** (`juce/Editor*.{h,cpp}`): `EqCanvas` (grid and labels cached in an `Image` per size / scale / range,
+  curve paths rebuilt only when the parameters, view, sample rate or size change, analyser paths per frame),
+  `BandPanel` (chips + attached controls), `KickEQEditor` (30 Hz timer: `process()` + `pull()`, curve refresh,
+  control sync). Global controls sit in a header bar and the analyser / curve selectors in a toolbar above the canvas
+  (not in the bottom strip) so that everything stays legible at the 720 x 420 minimum.
+
 ## 7. CLAP integration (native shell and JUCE shell)
 
 | Extension | Behaviour |
@@ -399,7 +426,7 @@ QEMU timings are only used for regression, never as an absolute figure.
 | `kickeq_core` (params, design, engine, curve, state) + unit tests | planned, in progress |
 | Spectrum analyser (FFT, SPSC, frames) | planned |
 | Native CLAP shell + `clap_testhost` conformance | planned |
-| JUCE shell on the core + editor | planned |
+| JUCE shell on the core + editor (`juce/`), `kickeq_editor_snapshot`, JUCE-profile conformance, cross-shell bit-exactness | **[done]** (macOS arm64; see section 6.1) |
 | Presets | planned |
 | CI matrix (incl. ARMv7/QEMU, iOS/Android) | planned |
 | Linear phase | designed (§4.7), implementation after the CPU benchmark |

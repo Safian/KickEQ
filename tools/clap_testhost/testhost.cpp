@@ -19,8 +19,10 @@
 
 #include "testhost.h"
 
+#include <cmath>
 #include <cstdarg>
 #include <cstring>
+#include <limits>
 
 #include "kickeq/clap_native.h"
 #include "kickeq/state.h"
@@ -226,7 +228,9 @@ void CLAP_ABI hostLog (const clap_host_t* h, clap_log_severity severity, const c
 {
     TestHost& t = hostOf (h);
     ++t.logTotal;
-    if (severity >= CLAP_LOG_ERROR)
+    // CLAP_LOG_HOST_MISBEHAVING is a complaint about this test host (it calls plugins out of range or too early on
+    // purpose); only the plugin's own errors count
+    if (severity >= CLAP_LOG_ERROR && severity != CLAP_LOG_HOST_MISBEHAVING)
         ++t.logErrors;
     std::printf ("      [plugin log %d] %s\n", static_cast<int> (severity), msg != nullptr ? msg : "");
 }
@@ -404,6 +408,13 @@ int64_t CLAP_ABI memWrite (const clap_ostream_t* s, const void* buf, uint64_t si
 }
 } // namespace
 
+namespace
+{
+bool g_juceProfile = false;
+}
+
+void setJuceProfile (bool on) { g_juceProfile = on; }
+
 Instance::Instance (TestHost& h, const clap_plugin_factory_t* factory) : host (h)
 {
     plugin = factory->create_plugin (factory, h.get(), "com.safian.kickeq");
@@ -426,6 +437,29 @@ Instance::Instance (TestHost& h, const clap_plugin_factory_t* factory) : host (h
     remote = static_cast<const clap_plugin_remote_controls_t*> (ext (CLAP_EXT_REMOTE_CONTROLS));
     presetLoad = static_cast<const clap_plugin_preset_load_t*> (ext (CLAP_EXT_PRESET_LOAD));
     analyzer = ext ("com.safian.kickeq/analyzer/1");
+
+    if (g_juceProfile && params != nullptr)
+    {
+        // the JUCE wrapper derives the CLAP id from the string id (a hash): map core ids to host ids by name
+        const uint32_t n = params->count (plugin);
+        for (uint32_t i = 0; i < n; ++i)
+        {
+            clap_param_info_t info {};
+            if (!params->get_info (plugin, i, &info))
+                continue;
+            for (int k = 0; k < kickeq::numParams; ++k)
+                if (std::strcmp (info.name, kickeq::paramInfo (k).name) == 0)
+                    idMap.emplace_back (kickeq::paramInfo (k).id, info.id);
+        }
+    }
+}
+
+uint32_t Instance::hostId (uint32_t coreId) const
+{
+    for (const auto& m : idMap)
+        if (m.first == coreId)
+            return m.second;
+    return coreId;
 }
 
 Instance::~Instance()
@@ -472,7 +506,7 @@ void Instance::deactivate()
 double Instance::value (uint32_t id) const
 {
     double v = -12345.0;
-    if (params == nullptr || !params->get_value (plugin, id, &v))
+    if (params == nullptr || !params->get_value (plugin, hostId (id), &v))
         return -12345.0;
     return v;
 }
@@ -485,8 +519,11 @@ std::array<double, kickeq::numParams> Instance::allValues() const
     return a;
 }
 
-void Instance::setParams (const std::vector<ParamEvent>& events)
+void Instance::setParams (const std::vector<ParamEvent>& coreEvents)
 {
+    std::vector<ParamEvent> events = coreEvents;
+    for (ParamEvent& e : events)
+        e.id = hostId (e.id);
     EventList list (events);
     clap_input_events_t in = { &list, &EventList::size, &EventList::get };
     clap_output_events_t out = { nullptr, &tryPush };
@@ -522,8 +559,11 @@ bool Instance::loadState (const std::vector<uint8_t>& blob, size_t maxChunk, int
 void Instance::pump() { plugin->on_main_thread (plugin); }
 
 clap_process_status Instance::process (const float* inL, const float* inR, float* outL, float* outR, uint32_t frames,
-                                       const std::vector<ParamEvent>& events, uint64_t* constantMask)
+                                       const std::vector<ParamEvent>& coreEvents, uint64_t* constantMask)
 {
+    std::vector<ParamEvent> events = coreEvents;
+    for (ParamEvent& e : events)
+        e.id = hostId (e.id);
     EventList list (events);
     clap_input_events_t in = { &list, &EventList::size, &EventList::get };
     clap_output_events_t out = { nullptr, &tryPush };
@@ -632,5 +672,57 @@ std::vector<uint8_t> baselineState()
     std::vector<uint8_t> blob (n);
     saveState (v, blob.data(), blob.size());
     return blob;
+}
+} // namespace th
+
+namespace th
+{
+int compareDumps (const std::string& pathA, const std::string& pathB)
+{
+    const auto readAll = [] (const std::string& path, std::vector<float>& out) {
+        std::FILE* f = std::fopen (path.c_str(), "rb");
+        if (f == nullptr)
+            return false;
+        float buf[4096];
+        size_t n;
+        while ((n = std::fread (buf, sizeof (float), 4096, f)) > 0)
+            out.insert (out.end(), buf, buf + n);
+        std::fclose (f);
+        return true;
+    };
+
+    std::vector<float> a, b;
+    section ("cross-shell comparison: native shell vs JUCE shell, same state blob, same 5 s noise at 44.1 and 48 kHz");
+    check (readAll (pathA, a) && readAll (pathB, b), "both dump files are readable", pathA + " | " + pathB);
+    check (!a.empty() && a.size() == b.size(), "both dumps have the same, non-zero length", fmt ("%zu vs %zu samples", a.size(), b.size()));
+    if (a.empty() || a.size() != b.size())
+        return 1;
+
+    size_t differing = 0, first = 0;
+    double maxDiff = 0.0;
+    for (size_t i = 0; i < a.size(); ++i)
+    {
+        uint32_t x = 0, y = 0;
+        std::memcpy (&x, &a[i], 4);
+        std::memcpy (&y, &b[i], 4);
+        if (x != y)
+        {
+            if (differing++ == 0)
+                first = i;
+            const double d = std::fabs (static_cast<double> (a[i]) - static_cast<double> (b[i]));
+            if (d > maxDiff || d != d)
+                maxDiff = d;
+        }
+    }
+    const double maxDb = maxDiff > 0.0 ? 20.0 * std::log10 (maxDiff) : -std::numeric_limits<double>::infinity();
+    std::printf ("      info: %zu of %zu samples differ, max abs difference %.3g (%.1f dBFS), first difference at sample %zu\n",
+                 differing, a.size(), maxDiff, maxDb, first);
+    check (allFinite (a) && allFinite (b), "both outputs are finite");
+    check (differing == 0, "outputs are bit-identical", fmt ("%zu differing samples, max %.3g (%.1f dBFS)", differing, maxDiff, maxDb));
+    // a bit-exact result is the expectation; below -120 dBFS the shells would still be inaudibly different
+    check (maxDb < -120.0, "max abs difference < -120 dBFS", fmt ("%.1f dBFS", maxDb));
+    const Report& r = report();
+    std::printf ("\n%d checks passed, %d failed\n", r.passed, r.failed);
+    return r.failed == 0 ? 0 : 1;
 }
 } // namespace th

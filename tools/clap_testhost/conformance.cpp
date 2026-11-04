@@ -20,6 +20,33 @@
 // The conformance suite of the native CLAP shell. Every check prints PASS or FAIL; the exit code is non-zero
 // when any check failed. The same suite runs against the static library (--static) and the loaded .clap.
 
+// JUCE profile (--juce)
+// ---------------------
+// The same suite runs against the CLAP built from the JUCE shell (clap-juce-extensions wrapper around
+// juce/PluginProcessor). Parameter ids are String::hashCode of the core string ids there, so Instance maps core ids
+// to host ids by name (testhost.cpp); everything else is the native expectation unless one of the following
+// legitimate differences of the wrapper applies (each place is marked "JUCE" in the code):
+//
+//   * descriptor: url is not published; get_plugin_descriptor (1) returns the descriptor instead of null; the
+//     wrapper does not validate a null host / null plugin id (no host does that); clap.gui is offered.
+//   * extensions the JUCE shell does not have: audio-ports-config (the layout is the host's choice; mono is a VST3
+//     layout, tested by kickeq_juce_shell_test), remote-controls, preset-discovery / preset-load (factory presets
+//     are JUCE programs), the analyser vendor extension (the editor draws the analyser itself).
+//   * params: flags (only bool parameters are STEPPED, nothing is ENUM or BYPASS); global parameters are at the top
+//     level of the JUCE parameter tree (empty CLAP module path); value_to_text uses strncpy without a terminator
+//     for tiny buffers, text_to_value cannot reject text, get_value of an unknown id is not validated.
+//   * values: a plain value that passes through the wrapper becomes a float normalised value and back, so float
+//     parameters read back through clap.params agree within 1e-5 (relative), bool / enum exactly. The processor
+//     stores exact plain values (juce/CoreParameter.h): a state blob loads with bit-identical values, which the
+//     cross-shell tests verify.
+//   * state: the wrapper cannot report a rejected blob (setStateInformation is void) so load returns true; the
+//     processor ignores invalid blobs, which is what is checked (parameters untouched). The UI01 chunk is owned and
+//     rewritten by the JUCE shell, so the "foreign chunk survives" check does not apply.
+//   * tail: reported on demand (no clap_host_tail::changed); process returns CLAP_PROCESS_CONTINUE and leaves
+//     constant_mask alone; parameter changes made inside the plugin are reported as output events.
+//   * events: the wrapper does not split at the event but in sub-blocks of a multiple of 64 samples
+//     (CLAP_PROCESS_EVENTS_RESOLUTION_SAMPLES 64); refBlockJuce reproduces that rule for the reference engine.
+//
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -53,6 +80,20 @@ struct Ctx
 };
 
 bool streq (const char* a, const char* b) { return a != nullptr && b != nullptr && std::strcmp (a, b) == 0; }
+
+// JUCE profile (--juce): the JUCE CLAP wrapper (clap-juce-extensions) hands plain values to the processor as a float
+// *normalised* number, so a float parameter read back through clap.params differs from the value that was written by
+// a few ulp (the processor itself stores the exact plain value, see juce/CoreParameter.h). Float parameters are
+// therefore compared with a relative tolerance in that profile; bool and enum parameters stay exact.
+bool near (const Ctx& c, uint32_t id, double got, double want)
+{
+    if (!c.options.juce)
+        return got == want;
+    const int i = indexOfId (id);
+    if (i < 0 || paramInfo (i).kind != Kind::Float)
+        return got == want;
+    return std::fabs (got - want) <= 1.0e-5 * std::max (1.0, std::fabs (want));
+}
 
 struct Rng
 {
@@ -113,6 +154,57 @@ void refBlock (EqEngine& eng, ParamValues& pv, float* l, float* r, uint32_t fram
         eng.process (pv, l + pos, r != nullptr ? r + pos : nullptr, static_cast<int> (frames - pos));
 }
 
+/** The JUCE wrapper converts the plain value of an event to a float normalised value before the processor sees it;
+    CoreParameter turns it back with the core's fromNormalized, so the engine gets fromNormalized (toNormalized (v)). */
+void applyViaNormalised (ParamValues& pv, const ParamEvent& e)
+{
+    const int idx = indexOfId (e.id);
+    if (idx < 0)
+        return;
+    const ParamInfo& info = paramInfo (idx);
+    const float normalised = toNormalized (info, static_cast<float> (e.value));
+    pv.set (idx, fromNormalized (info, normalised));
+}
+
+/** Reference for the JUCE CLAP wrapper (clap-juce-extensions, built with CLAP_PROCESS_EVENTS_RESOLUTION_SAMPLES 64,
+    CLAP_ALWAYS_SPLIT_BLOCK off): it does not split exactly at an event but works in sub-blocks that are a multiple
+    of 64 samples long. A sub-block starting at n ends at the first multiple of 64 samples (counted from n) that
+    reaches the next parameter event at or after n + 64 (or at the end of the host block); every event that lies
+    inside the sub-block is applied before it is processed. The engine itself is block-size independent, so the
+    only difference to the native shell is the point in time at which an event reaches the engine. */
+void refBlockJuce (EqEngine& eng, ParamValues& pv, float* l, float* r, uint32_t frames, const std::vector<ParamEvent>& ev)
+{
+    constexpr uint32_t resolution = 64;
+    size_t next = 0;
+    uint32_t n = 0;
+    while (n < frames)
+    {
+        const uint32_t remaining = frames - n;
+        uint32_t untilNext = remaining;
+        for (size_t e = next; e < ev.size(); ++e)
+            if (ev[e].time >= n + resolution)
+            {
+                untilNext = ev[e].time - n;
+                break;
+            }
+        uint32_t len = remaining;
+        if (remaining > resolution)
+        {
+            const uint32_t smallBlocks = (untilNext + resolution - 1) / resolution;
+            len = smallBlocks * resolution < remaining ? smallBlocks * resolution : remaining;
+        }
+        while (next < ev.size() && ev[next].time < n + len)
+        {
+            applyViaNormalised (pv, ev[next]);
+            ++next;
+        }
+        eng.process (pv, l + n, r != nullptr ? r + n : nullptr, static_cast<int> (len));
+        n += len;
+    }
+    for (; next < ev.size(); ++next) // events at or beyond the end of the block
+        applyViaNormalised (pv, ev[next]);
+}
+
 std::unique_ptr<EqEngine> makeRef (double rate)
 {
     auto e = std::make_unique<EqEngine>();
@@ -151,14 +243,16 @@ void testDescriptor (Ctx& c)
     check (f->get_plugin_count (f) == 1, "exactly one plugin");
     const clap_plugin_descriptor_t* d = f->get_plugin_descriptor (f, 0);
     check (d != nullptr, "descriptor 0 exists");
-    check (f->get_plugin_descriptor (f, 1) == nullptr, "descriptor 1 does not exist");
+    if (!c.options.juce) // the JUCE wrapper returns its descriptor for any index
+        check (f->get_plugin_descriptor (f, 1) == nullptr, "descriptor 1 does not exist");
     if (d == nullptr)
         return;
     check (clap_version_is_compatible (d->clap_version), "descriptor clap_version compatible");
     check (streq (d->id, "com.safian.kickeq"), "id com.safian.kickeq", d->id != nullptr ? d->id : "(null)");
     check (streq (d->name, "KickEQ"), "name KickEQ");
     check (streq (d->vendor, "Safian"), "vendor Safian");
-    check (streq (d->url, "https://github.com/Safian/KickEQ"), "url");
+    if (!c.options.juce) // the JUCE wrapper publishes JucePlugin_ManufacturerWebsite (not set for this plugin)
+        check (streq (d->url, "https://github.com/Safian/KickEQ"), "url");
     check (streq (d->version, KICKEQ_EXPECTED_VERSION), "version from CMake project()", d->version != nullptr ? d->version : "(null)");
     check (d->description != nullptr && d->description[0] != '\0', "description present");
 
@@ -168,14 +262,21 @@ void testDescriptor (Ctx& c)
     check (feats == std::vector<std::string> { "audio-effect", "equalizer", "stereo" }, "features: audio-effect equalizer stereo");
 
     check (f->create_plugin (f, c.host.get(), "com.example.other") == nullptr, "create_plugin with a foreign id fails");
-    check (f->create_plugin (f, nullptr, "com.safian.kickeq") == nullptr, "create_plugin without host fails");
-    check (f->create_plugin (f, c.host.get(), nullptr) == nullptr, "create_plugin without id fails");
+    if (!c.options.juce) // the JUCE wrapper dereferences the host / id without checking (not called that way by hosts)
+    {
+        check (f->create_plugin (f, nullptr, "com.safian.kickeq") == nullptr, "create_plugin without host fails");
+        check (f->create_plugin (f, c.host.get(), nullptr) == nullptr, "create_plugin without id fails");
+    }
     check (c.loader.getFactory ("com.example.no-such-factory") == nullptr, "unknown factory id returns null");
-    check (c.loader.presets() != nullptr, "preset discovery factory is exposed");
+    if (!c.options.juce) // no clap.preset-discovery in the JUCE shell (factory presets are JUCE programs there)
+        check (c.loader.presets() != nullptr, "preset discovery factory is exposed");
 
     Instance inst (c.host, f);
     check (inst.ok() && inst.plugin->desc == d, "plugin->desc is the factory descriptor");
-    check (inst.plugin != nullptr && inst.plugin->get_extension (inst.plugin, "clap.gui") == nullptr, "clap.gui is not offered");
+    if (c.options.juce) // the JUCE shell is the one that offers an editor
+        check (inst.plugin != nullptr && inst.plugin->get_extension (inst.plugin, CLAP_EXT_GUI) != nullptr, "clap.gui is offered");
+    else
+        check (inst.plugin != nullptr && inst.plugin->get_extension (inst.plugin, "clap.gui") == nullptr, "clap.gui is not offered");
     check (inst.plugin != nullptr && inst.plugin->get_extension (inst.plugin, "com.example.unknown") == nullptr, "unknown extension is null");
 }
 
@@ -205,6 +306,7 @@ void testLifecycle (Ctx& c)
     }
     check (ok, "20x activate / process / deactivate / re-activate at another rate");
 
+    if (!c.options.juce) // the JUCE wrapper accepts any rate (hosts never pass 0)
     {
         Instance inst (c.host, c.factory);
         check (!inst.plugin->activate (inst.plugin, 0.0, 1, 512), "activate with sample rate 0 fails");
@@ -216,9 +318,10 @@ void testLifecycle (Ctx& c)
         i0.setParam (idOf (0, BandParam::freq), 77.0);
         i1.setParam (idOf (0, BandParam::freq), 88.0);
         i2.setParam (paramInfo (paramOutGain).id, 5.0);
-        bool indep = i0.value (idOf (0, BandParam::freq)) == 77.0 && i1.value (idOf (0, BandParam::freq)) == 88.0
-                     && i2.value (idOf (0, BandParam::freq)) == 30.0 && i3.value (idOf (0, BandParam::freq)) == 30.0
-                     && i2.value (paramInfo (paramOutGain).id) == 5.0 && i0.value (paramInfo (paramOutGain).id) == 0.0;
+        const uint32_t f0 = idOf (0, BandParam::freq), og = paramInfo (paramOutGain).id;
+        bool indep = near (c, f0, i0.value (f0), 77.0) && near (c, f0, i1.value (f0), 88.0)
+                     && near (c, f0, i2.value (f0), 30.0) && near (c, f0, i3.value (f0), 30.0)
+                     && near (c, og, i2.value (og), 5.0) && near (c, og, i0.value (og), 0.0);
         check (indep, "4 simultaneous instances keep independent parameters");
     }
 
@@ -249,6 +352,14 @@ void testParams (Ctx& c)
 
     std::set<clap_id> ids;
     std::string firstBad;
+    // JUCE profile: ids are String::hashCode of the string id (the host-side ids differ from the core ids)
+    const auto javaHash = [] (const char* text) {
+        int32_t h = 0;
+        for (; *text != '\0'; ++text)
+            h = static_cast<int32_t> (31u * static_cast<uint32_t> (h) + static_cast<uint32_t> (static_cast<unsigned char> (*text)));
+        return static_cast<uint32_t> (h);
+    };
+    bool hashOk = true, mappedOk = true;
     bool infoOk = true, orderOk = true, flagsOk = true, rangesOk = true, namesOk = true, defaultsOk = true;
     for (int i = 0; i < numParams; ++i)
     {
@@ -260,17 +371,23 @@ void testParams (Ctx& c)
         }
         const ParamInfo& t = paramInfo (i);
         ids.insert (info.id);
-        orderOk = orderOk && info.id == t.id;
-        namesOk = namesOk && streq (info.name, t.name) && streq (info.module, t.module) && info.name[0] != '\0'
-                  && info.module[0] != '\0';
+        hashOk = hashOk && info.id == javaHash (t.strId);
+        mappedOk = mappedOk && inst.hostId (t.id) == info.id;
+        orderOk = orderOk && (c.options.juce ? true : info.id == t.id);
+        // JUCE profile: the bands are parameter groups (CLAP module "Band N"); the three global parameters sit at the
+        // top level of the JUCE parameter tree, which the wrapper reports as an empty module path
+        const bool moduleOk = c.options.juce && std::strcmp (t.module, "Global") == 0 ? info.module[0] == '\0'
+                                                                                       : streq (info.module, t.module) && info.module[0] != '\0';
+        namesOk = namesOk && streq (info.name, t.name) && moduleOk && info.name[0] != '\0';
         rangesOk = rangesOk && info.min_value == static_cast<double> (t.min) && info.max_value == static_cast<double> (t.max)
                    && info.min_value < info.max_value && std::isfinite (info.min_value) && std::isfinite (info.max_value);
-        defaultsOk = defaultsOk && info.default_value == static_cast<double> (t.def) && info.default_value >= info.min_value
+        defaultsOk = defaultsOk && near (c, t.id, info.default_value, static_cast<double> (t.def)) && info.default_value >= info.min_value
                      && info.default_value <= info.max_value;
         const bool stepped = (info.flags & CLAP_PARAM_IS_STEPPED) != 0;
-        const bool wantStepped = t.kind != Kind::Float;
-        const bool wantEnum = t.kind == Kind::Enum;
-        const bool wantBypass = i == paramBypass;
+        // JUCE profile: the wrapper flags only bool parameters as stepped, never as enum or bypass
+        const bool wantStepped = c.options.juce ? t.kind == Kind::Bool : t.kind != Kind::Float;
+        const bool wantEnum = !c.options.juce && t.kind == Kind::Enum;
+        const bool wantBypass = !c.options.juce && i == paramBypass;
         flagsOk = flagsOk && (info.flags & CLAP_PARAM_IS_AUTOMATABLE) != 0 && stepped == wantStepped
                   && ((info.flags & CLAP_PARAM_IS_ENUM) != 0) == wantEnum
                   && ((info.flags & CLAP_PARAM_IS_BYPASS) != 0) == wantBypass
@@ -280,7 +397,15 @@ void testParams (Ctx& c)
     }
     check (infoOk, "get_info succeeds for every index");
     check (ids.size() == static_cast<size_t> (numParams), "ids are unique");
-    check (orderOk, "index order == core table order");
+    if (c.options.juce)
+    {
+        check (hashOk, "JUCE: parameter id == String::hashCode of the core string id");
+        check (mappedOk, "JUCE: every core parameter maps to exactly one host parameter (by name)");
+    }
+    else
+    {
+        check (orderOk, "index order == core table order");
+    }
     check (namesOk, "names and module paths == core table, non-empty");
     check (rangesOk, "min / max == core table, finite");
     check (defaultsOk, "default values == core table, inside range");
@@ -288,11 +413,12 @@ void testParams (Ctx& c)
     clap_param_info_t dummy {};
     check (!pe->get_info (p, static_cast<uint32_t> (numParams), &dummy), "get_info out of range fails");
     double out = 0;
-    check (!pe->get_value (p, 0xDEAD, &out) && !pe->get_value (p, 3, &out), "get_value of an unknown / reserved id fails");
+    if (!c.options.juce) // the JUCE wrapper indexes its id map without checking
+        check (!pe->get_value (p, 0xDEAD, &out) && !pe->get_value (p, 3, &out), "get_value of an unknown / reserved id fails");
 
     bool defOk = true;
     for (int i = 0; i < numParams; ++i)
-        defOk = defOk && inst.value (paramInfo (i).id) == static_cast<double> (paramInfo (i).def);
+        defOk = defOk && near (c, paramInfo (i).id, inst.value (paramInfo (i).id), static_cast<double> (paramInfo (i).def));
     check (defOk, "get_value of a fresh instance == defaults");
 
     // text conversion round trips
@@ -312,9 +438,9 @@ void testParams (Ctx& c)
         {
             char a[128] = {}, b[128] = {};
             double back = 0;
-            const bool o1 = pe->value_to_text (p, t.id, v, a, sizeof a);
-            const bool o2 = o1 && pe->text_to_value (p, t.id, a, &back);
-            const bool o3 = o2 && pe->value_to_text (p, t.id, back, b, sizeof b);
+            const bool o1 = pe->value_to_text (p, inst.hostId (t.id), v, a, sizeof a);
+            const bool o2 = o1 && pe->text_to_value (p, inst.hostId (t.id), a, &back);
+            const bool o3 = o2 && pe->value_to_text (p, inst.hostId (t.id), back, b, sizeof b);
             const bool exact = t.kind == Kind::Float || back == v;
             const bool idem = o3 && std::strcmp (a, b) == 0;
             if (!(o1 && o2 && a[0] != '\0' && exact && idem) && detail.empty())
@@ -322,15 +448,21 @@ void testParams (Ctx& c)
             textOk = textOk && o1 && o2 && a[0] != '\0' && exact;
             idemOk = idemOk && idem;
         }
-        char tiny[3] = { 'x', 'x', 'x' };
-        smallBufOk = smallBufOk && pe->value_to_text (p, t.id, t.def, tiny, 3) && std::strlen (tiny) < 3;
-        double d = 0;
-        junkOk = junkOk && !pe->text_to_value (p, t.id, "zzz not a value", &d);
+        if (!c.options.juce) // the JUCE wrapper uses strncpy (no terminator when truncated) and cannot reject text
+        {
+            char tiny[3] = { 'x', 'x', 'x' };
+            smallBufOk = smallBufOk && pe->value_to_text (p, t.id, t.def, tiny, 3) && std::strlen (tiny) < 3;
+            double d = 0;
+            junkOk = junkOk && !pe->text_to_value (p, t.id, "zzz not a value", &d);
+        }
     }
     check (textOk, "value_to_text -> text_to_value round trip (exact for bool/enum)", detail);
     check (idemOk, "text is stable: value_to_text (text_to_value (text)) == text", detail);
-    check (smallBufOk, "value_to_text honours a tiny buffer (NUL terminated)");
-    check (junkOk, "text_to_value rejects garbage");
+    if (!c.options.juce)
+    {
+        check (smallBufOk, "value_to_text honours a tiny buffer (NUL terminated)");
+        check (junkOk, "text_to_value rejects garbage");
+    }
 
     // events through flush (plugin not processing)
     bool maxOk = true, minOk = true, midOk = true, clampOk = true, nanOk = true;
@@ -338,19 +470,19 @@ void testParams (Ctx& c)
     {
         const ParamInfo& t = paramInfo (i);
         inst.setParam (t.id, t.max);
-        maxOk = maxOk && inst.value (t.id) == static_cast<double> (t.max);
+        maxOk = maxOk && near (c, t.id, inst.value (t.id), static_cast<double> (t.max));
         inst.setParam (t.id, t.min);
-        minOk = minOk && inst.value (t.id) == static_cast<double> (t.min);
+        minOk = minOk && near (c, t.id, inst.value (t.id), static_cast<double> (t.min));
         const double mid = t.min + 0.37 * (t.max - t.min);
         inst.setParam (t.id, mid);
         const float expect = clampParam (t, static_cast<float> (mid));
-        midOk = midOk && inst.value (t.id) == static_cast<double> (expect);
+        midOk = midOk && near (c, t.id, inst.value (t.id), static_cast<double> (expect));
         inst.setParam (t.id, 1.0e300);
-        clampOk = clampOk && inst.value (t.id) == static_cast<double> (t.max);
+        clampOk = clampOk && near (c, t.id, inst.value (t.id), static_cast<double> (t.max));
         inst.setParam (t.id, -1.0e300);
-        clampOk = clampOk && inst.value (t.id) == static_cast<double> (t.min);
+        clampOk = clampOk && near (c, t.id, inst.value (t.id), static_cast<double> (t.min));
         inst.setParam (t.id, std::nan (""));
-        nanOk = nanOk && inst.value (t.id) == static_cast<double> (t.def);
+        nanOk = nanOk && near (c, t.id, inst.value (t.id), static_cast<double> (t.def));
     }
     check (maxOk && minOk, "flush: PARAM_VALUE at min / max is applied");
     check (midOk, "flush: mid values are applied (stepped ones rounded)");
@@ -369,7 +501,7 @@ void testParams (Ctx& c)
         ev.header.size = sizeof ev;
         ev.header.space_id = 77;
         ev.header.type = CLAP_EVENT_PARAM_VALUE;
-        ev.param_id = paramInfo (paramOutGain).id;
+        ev.param_id = inst.hostId (paramInfo (paramOutGain).id);
         ev.value = 12.0;
         struct L
         {
@@ -382,14 +514,14 @@ void testParams (Ctx& c)
                                    } };
         clap_output_events_t sink = { nullptr, [] (const clap_output_events_t*, const clap_event_header_t*) -> bool { return true; } };
         pe->flush (p, &in, &sink);
-        check (inst.value (paramInfo (paramOutGain).id) == 0.0, "flush: events of a foreign event space are ignored");
+        check (near (c, paramInfo (paramOutGain).id, inst.value (paramInfo (paramOutGain).id), 0.0), "flush: events of a foreign event space are ignored");
     }
 
     // set while active (flush on the audio thread)
     Instance act (c.host, c.factory);
     act.activate (48000.0);
     act.setParam (paramInfo (paramOutGain).id, -6.0);
-    check (act.value (paramInfo (paramOutGain).id) == -6.0, "flush while active applies events");
+    check (near (c, paramInfo (paramOutGain).id, act.value (paramInfo (paramOutGain).id), -6.0), "flush while active applies events");
 }
 
 void testState (Ctx& c)
@@ -416,12 +548,13 @@ void testState (Ctx& c)
     check (loadState (blob.data(), blob.size(), viaCore), "the saved blob is a valid core state");
     bool coreEq = true;
     for (int i = 0; i < numParams; ++i)
-        coreEq = coreEq && static_cast<double> (viaCore.get (i)) == valuesA[static_cast<size_t> (i)];
+        coreEq = coreEq && near (c, paramInfo (i).id, valuesA[static_cast<size_t> (i)], static_cast<double> (viaCore.get (i)));
     check (coreEq, "core loadState of the blob == plugin parameter values");
 
     c.host.paramsRescan = 0;
     check (b.loadState (blob), "load into a fresh instance");
-    check (c.host.paramsRescan.load() == 1, "state load asks the host to rescan the parameter values (main thread)");
+    if (!c.options.juce) // the JUCE wrapper announces changes through the processor listener instead
+        check (c.host.paramsRescan.load() == 1, "state load asks the host to rescan the parameter values (main thread)");
     check (b.allValues() == valuesA, "state save -> load: identical parameters");
     check (b.saveState() == blob, "save is deterministic (save -> load -> save is identical)");
 
@@ -450,7 +583,9 @@ void testState (Ctx& c)
         {
             std::vector<uint8_t> cut (blob.begin(), blob.begin() + static_cast<std::ptrdiff_t> (len));
             const bool r = victim.loadState (cut, len % 5 + 1);
-            allFail = allFail && !r;
+            // the JUCE wrapper cannot report a rejected state (setStateInformation is void): it returns true
+            // for every non-empty stream; the processor ignores an invalid blob, which `untouched` verifies
+            allFail = allFail && (c.options.juce ? (len != 0 || !r) : !r);
             untouched = untouched && victim.allValues() == snap;
         }
         check (allFail, "every truncated state is rejected", "");
@@ -470,10 +605,12 @@ void testState (Ctx& c)
             for (int k = 0; k < numParams; ++k)
                 noCrash = noCrash && now[static_cast<size_t> (k)] >= static_cast<double> (paramInfo (k).min)
                           && now[static_cast<size_t> (k)] <= static_cast<double> (paramInfo (k).max);
-            if (!r)
+            // a blob the core rejects must leave the parameters untouched, whatever the shell returns for it
+            ParamValues parsed;
+            const bool valid = loadState (junk.data(), junk.size(), parsed);
+            if (!valid && (!r || c.options.juce))
                 noCrash = noCrash && now == snap;
-            else
-                snap = now; // (very unlikely) accepted blob: it becomes the reference for later rejections
+            snap = now; // (very unlikely) accepted blob: it becomes the reference for later rejections
         }
         check (noCrash, "300 garbage / random-header blobs: no crash, values always in range");
 
@@ -500,6 +637,7 @@ void testState (Ctx& c)
     }
 
     // a foreign editor chunk is preserved across a load / save (JUCE shell compatibility)
+    if (!c.options.juce) // the JUCE shell owns the UI01 chunk: it parses its own layout and writes it back normalised
     {
         const uint8_t chunk[5] = { 1, 2, 3, 4, 5 };
         UiChunk ui;
@@ -535,7 +673,7 @@ void testState (Ctx& c)
         put32 (0x3f800000u);
         put32 (0);
         Instance x (c.host, c.factory);
-        check (x.loadState (raw) && x.value (paramInfo (paramOutGain).id) == -4.0, "state of a later version with an unknown id loads");
+        check (x.loadState (raw) && near (c, paramInfo (paramOutGain).id, x.value (paramInfo (paramOutGain).id), -4.0), "state of a later version with an unknown id loads");
     }
 }
 
@@ -566,25 +704,36 @@ void testLatencyTail (Ctx& c)
     ref->process (pv, rl.data(), rr.data(), 512);
     const uint32_t tail = inst.tail->get (inst.plugin);
     check (tail > 0 && tail == ref->getTailSamples(), "tail == core EqEngine tail after processing", fmt ("%u vs %u", tail, ref->getTailSamples()));
-    check (c.host.tailChanged.load() == 1, "material tail change -> host tail.changed from the audio thread (once)", fmt ("%d", c.host.tailChanged.load()));
+    // the JUCE wrapper reports the tail only when asked (no clap_host_tail::changed): not checked in that profile
+    if (!c.options.juce)
+        check (c.host.tailChanged.load() == 1, "material tail change -> host tail.changed from the audio thread (once)", fmt ("%d", c.host.tailChanged.load()));
 
     inst.process (in.data(), in.data(), outL.data(), outR.data(), 512);
-    check (c.host.tailChanged.load() == 1, "unchanged tail: no further tail.changed");
+    if (!c.options.juce)
+        check (c.host.tailChanged.load() == 1, "unchanged tail: no further tail.changed");
 
     inst.setParam (paramInfo (paramBypass).id, 1.0);
     for (int i = 0; i < 4; ++i)
         inst.process (in.data(), in.data(), outL.data(), outR.data(), 512);
-    check (inst.tail->get (inst.plugin) == 0 && c.host.tailChanged.load() == 2, "bypass: tail drops to 0 and the host is told", fmt ("tail %u changed %d", inst.tail->get (inst.plugin), c.host.tailChanged.load()));
-    inst.pump(); // on_main_thread is a harmless no-op
-    check (c.host.tailChanged.load() == 2, "on_main_thread does not call back into the host");
+    if (c.options.juce)
+    {
+        check (inst.tail->get (inst.plugin) == 0, "bypass: tail drops to 0", fmt ("tail %u", inst.tail->get (inst.plugin)));
+    }
+    else
+    {
+        check (inst.tail->get (inst.plugin) == 0 && c.host.tailChanged.load() == 2, "bypass: tail drops to 0 and the host is told", fmt ("tail %u changed %d", inst.tail->get (inst.plugin), c.host.tailChanged.load()));
+        inst.pump(); // on_main_thread is a harmless no-op
+        check (c.host.tailChanged.load() == 2, "on_main_thread does not call back into the host");
+    }
 }
 
 void testPorts (Ctx& c)
 {
     section ("clap.audio-ports and audio-ports-config");
     Instance inst (c.host, c.factory);
-    check (inst.ports != nullptr && inst.portsConfig != nullptr, "audio-ports and audio-ports-config present");
-    if (inst.ports == nullptr || inst.portsConfig == nullptr)
+    // the JUCE wrapper offers audio-ports only: the layout (stereo, or mono in the VST3) is the host's choice there
+    check (inst.ports != nullptr && (c.options.juce || inst.portsConfig != nullptr), c.options.juce ? "audio-ports present" : "audio-ports and audio-ports-config present");
+    if (inst.ports == nullptr || (!c.options.juce && inst.portsConfig == nullptr))
         return;
     const clap_plugin_t* p = inst.plugin;
     check (inst.ports->count (p, true) == 1 && inst.ports->count (p, false) == 1, "1 input port, 1 output port");
@@ -592,10 +741,13 @@ void testPorts (Ctx& c)
     check (inst.ports->get (p, 0, true, &in) && inst.ports->get (p, 0, false, &out), "get port 0 in / out");
     check (in.channel_count == 2 && out.channel_count == 2 && streq (in.port_type, CLAP_PORT_STEREO) && streq (out.port_type, CLAP_PORT_STEREO), "stereo in / out");
     check ((in.flags & CLAP_AUDIO_PORT_IS_MAIN) != 0 && (out.flags & CLAP_AUDIO_PORT_IS_MAIN) != 0, "ports are main ports");
-    check (in.in_place_pair == out.id && out.in_place_pair == in.id, "in-place pair links input and output");
+    if (!c.options.juce) // the JUCE wrapper does not declare in-place pairs
+        check (in.in_place_pair == out.id && out.in_place_pair == in.id, "in-place pair links input and output");
     check (in.name[0] != '\0', "port has a name");
     clap_audio_port_info_t none {};
     check (!inst.ports->get (p, 1, true, &none) && !inst.ports->get (p, 1, false, &none), "port 1 does not exist");
+    if (c.options.juce)
+        return;
 
     check (inst.portsConfig->count (p) == 2, "2 audio-ports configs");
     clap_audio_ports_config_t cfg0 {}, cfg1 {};
@@ -804,10 +956,21 @@ void testProcessFlat (Ctx& c)
     std::vector<float> a = makeNoise (64, 1), b (64);
     uint64_t mask = ~uint64_t (0);
     const clap_process_status st = inst.process (a.data(), a.data(), b.data(), b.data(), 64, {}, &mask);
-    check (st == CLAP_PROCESS_CONTINUE_IF_NOT_QUIET, "returns CLAP_PROCESS_CONTINUE_IF_NOT_QUIET");
-    check (mask == 0, "output constant_mask is cleared even when the host flagged the input as constant");
-    check (c.host.outEventsPushed.load() == 0, "no output events are emitted");
-    check (inst.process (a.data(), a.data(), b.data(), b.data(), 0) == CLAP_PROCESS_CONTINUE_IF_NOT_QUIET, "frames_count == 0 is accepted");
+    if (c.options.juce) // the JUCE wrapper always answers CLAP_PROCESS_CONTINUE and leaves constant_mask alone
+    {
+        check (st == CLAP_PROCESS_CONTINUE, "returns CLAP_PROCESS_CONTINUE");
+        check (inst.process (a.data(), a.data(), b.data(), b.data(), 0) != CLAP_PROCESS_ERROR, "frames_count == 0 is accepted");
+    }
+    else
+    {
+        check (st == CLAP_PROCESS_CONTINUE_IF_NOT_QUIET, "returns CLAP_PROCESS_CONTINUE_IF_NOT_QUIET");
+        check (mask == 0, "output constant_mask is cleared even when the host flagged the input as constant");
+        check (inst.process (a.data(), a.data(), b.data(), b.data(), 0) == CLAP_PROCESS_CONTINUE_IF_NOT_QUIET, "frames_count == 0 is accepted");
+    }
+    (void) mask;
+    // the JUCE wrapper reports parameter changes made inside the plugin (state load) to the host as output events
+    if (!c.options.juce)
+        check (c.host.outEventsPushed.load() == 0, "no output events are emitted");
 }
 
 void testProcessEvents (Ctx& c)
@@ -843,7 +1006,10 @@ void testProcessEvents (Ctx& c)
             Stereo out (blockLen[blk]);
             Stereo want = in;
             inst.process (in.l.data(), in.r.data(), out.l.data(), out.r.data(), blockLen[blk], events[static_cast<size_t> (blk)]);
-            refBlock (*ref, pv, want.l.data(), want.r.data(), blockLen[blk], events[static_cast<size_t> (blk)]);
+            if (c.options.juce)
+                refBlockJuce (*ref, pv, want.l.data(), want.r.data(), blockLen[blk], events[static_cast<size_t> (blk)]);
+            else
+                refBlock (*ref, pv, want.l.data(), want.r.data(), blockLen[blk], events[static_cast<size_t> (blk)]);
             size_t at = 0;
             if (!bitEqual (out.l, want.l, &at) || !bitEqual (out.r, want.r, &at))
             {
@@ -851,11 +1017,17 @@ void testProcessEvents (Ctx& c)
                 detail = fmt ("block %d first difference at %zu", blk, at);
             }
         }
-        check (same, startPreset == 1 ? "events split the block exactly like the core engine (Kick Punch start)"
-                                      : "events split the block exactly like the core engine (Telephone start)",
-               detail);
-        bool valuesOk = inst.value (paramInfo (paramAutoGain).id) == 1.0 && inst.value (idOf (3, BandParam::q)) == 0.5 // 5000 > frames: applied at the end
-                        && inst.value (idOf (7, BandParam::freq)) == 50.0;
+        if (c.options.juce)
+            check (same, startPreset == 1 ? "events: output == core engine split like the JUCE CLAP wrapper (64-sample sub-blocks; Kick Punch start)"
+                                          : "events: output == core engine split like the JUCE CLAP wrapper (64-sample sub-blocks; Telephone start)",
+                   detail);
+        else
+            check (same, startPreset == 1 ? "events split the block exactly like the core engine (Kick Punch start)"
+                                          : "events split the block exactly like the core engine (Telephone start)",
+                   detail);
+        bool valuesOk = near (c, paramInfo (paramAutoGain).id, inst.value (paramInfo (paramAutoGain).id), 1.0)
+                        && near (c, idOf (3, BandParam::q), inst.value (idOf (3, BandParam::q)), 0.5) // 5000 > frames: applied at the end
+                        && near (c, idOf (7, BandParam::freq), inst.value (idOf (7, BandParam::freq)), 50.0);
         check (valuesOk, "get_value reflects events applied during process");
     }
 
@@ -868,7 +1040,7 @@ void testProcessEvents (Ctx& c)
         Stereo oa (512), ob (512);
         a.process (in.l.data(), in.r.data(), oa.l.data(), oa.r.data(), 512, { { 0, idOf (2, BandParam::on), 1.0 }, { 0, idOf (2, BandParam::gain), 12.0 } });
         b.process (in.l.data(), in.r.data(), ob.l.data(), ob.r.data(), 512);
-        check (!(oa == ob) && a.value (idOf (2, BandParam::on)) == 1.0, "an event at frame 0 takes effect in the same block");
+        check (!(oa == ob) && near (c, idOf (2, BandParam::on), a.value (idOf (2, BandParam::on)), 1.0), "an event at frame 0 takes effect in the same block");
     }
 
     // frames_count == 0 with events still applies them
@@ -877,7 +1049,8 @@ void testProcessEvents (Ctx& c)
         inst.activate (rate);
         float dummy[1] = { 0 };
         inst.process (dummy, dummy, dummy, dummy, 0, { { 0, paramInfo (paramOutGain).id, -9.0 } });
-        check (inst.value (paramInfo (paramOutGain).id) == -9.0, "events in a block with frames_count == 0 are applied");
+        // the JUCE wrapper applies events after its (empty) sample loop, so this holds there as well
+        check (near (c, paramInfo (paramOutGain).id, inst.value (paramInfo (paramOutGain).id), -9.0), "events in a block with frames_count == 0 are applied");
     }
 }
 
@@ -968,6 +1141,7 @@ void testProcessBlocks (Ctx& c)
         check (silent, "reset () clears the filter state (silence in, silence out)");
     }
 
+    if (!c.options.juce) // JUCE shell: mono is a VST3 layout, exercised by kickeq_juce_shell_test
     {
         // mono
         Instance inst (c.host, c.factory);
@@ -997,7 +1171,8 @@ void testProcessBlocks (Ctx& c)
         // offline render mode
         Instance rt (c.host, c.factory), off (c.host, c.factory);
         check (off.render != nullptr && !off.render->has_hard_realtime_requirement (off.plugin), "render: no hard realtime requirement");
-        check (!off.render->set (off.plugin, 5), "render.set rejects an unknown mode");
+        if (!c.options.juce) // the JUCE wrapper maps every mode != realtime to non-realtime
+            check (!off.render->set (off.plugin, 5), "render.set rejects an unknown mode");
         check (off.render->set (off.plugin, CLAP_RENDER_OFFLINE), "render.set (offline)");
         rt.activate (rate);
         off.activate (rate);
@@ -1031,6 +1206,19 @@ void testBaseline (Ctx& c)
         Instance inst (c.host, c.factory);
         inst.activate (rate, 1, 512);
         const bool loaded = inst.loadState (blob);
+        if (rate == 48000.0 && !c.options.dumpSaved.empty())
+        {
+            const std::vector<uint8_t> saved = inst.saveState();
+            if (std::FILE* f = std::fopen (c.options.dumpSaved.c_str(), "wb"))
+            {
+                std::fwrite (saved.data(), 1, saved.size(), f);
+                std::fclose (f);
+            }
+            else
+            {
+                check (false, "write --dump-saved file");
+            }
+        }
         const Stereo out = shellRun (inst, in, { 512 }, false);
 
         ParamValues pv;
@@ -1062,6 +1250,48 @@ void testBaseline (Ctx& c)
             check (false, "write --dump-output file");
         }
     }
+}
+
+/** A blob saved by the other shell: loading it must reproduce every parameter value bit-exactly (the plain values
+    are what the audio thread reads), whichever shell wrote it. */
+void testForeignState (Ctx& c)
+{
+    section ("state blob saved by another shell: identical parameter values");
+    std::vector<uint8_t> blob;
+    if (std::FILE* f = std::fopen (c.options.stateFile.c_str(), "rb"))
+    {
+        uint8_t buf[4096];
+        size_t n;
+        while ((n = std::fread (buf, 1, sizeof buf, f)) > 0)
+            blob.insert (blob.end(), buf, buf + n);
+        std::fclose (f);
+    }
+    check (!blob.empty(), "state file is readable", c.options.stateFile);
+    ParamValues want;
+    check (!blob.empty() && loadState (blob.data(), blob.size(), want), "the file is a valid core state blob");
+
+    Instance inst (c.host, c.factory);
+    check (inst.ok() && inst.loadState (blob), "the plugin accepts the blob");
+    const std::vector<uint8_t> saved = inst.saveState();
+    ParamValues got;
+    UiChunk ui;
+    check (loadState (saved.data(), saved.size(), got, &ui), "the plugin saves a valid core state blob again");
+    bool exact = true;
+    int nonDefault = 0;
+    for (int i = 0; i < numParams; ++i)
+    {
+        const float a = want.get (i), b = got.get (i);
+        exact = exact && std::memcmp (&a, &b, sizeof a) == 0;
+        nonDefault += a != paramInfo (i).def ? 1 : 0;
+    }
+    check (exact, "all parameter values are bit-identical after load -> save", fmt ("%d of %d differ from the defaults", nonDefault, numParams));
+    check (nonDefault > 10, "the blob is not trivial (many non-default parameters)");
+    bool viaParams = true;
+    for (int i = 0; i < numParams; ++i)
+        viaParams = viaParams && near (c, paramInfo (i).id, inst.value (paramInfo (i).id), static_cast<double> (want.get (i)));
+    check (viaParams, "clap.params get_value reports the blob values");
+    if (c.options.juce)
+        check (ui.data != nullptr && ui.size >= 1, "the JUCE shell stores its editor state in the UI01 chunk");
 }
 
 void testAnalyzer (Ctx& c)
@@ -1193,12 +1423,15 @@ void testConcurrency (Ctx& c)
         stateOk = stateOk && !blob.empty();
         if (rounds % 3 == 0)
             stateOk = stateOk && inst.loadState (blob);
-        if (rounds % 5 == 0)
-            an->set_enabled (inst.plugin, (rounds / 5) % 2 == 0);
-        an->get_frame (inst.plugin, pre.data(), post.data(), 512);
+        if (an != nullptr)
+        {
+            if (rounds % 5 == 0)
+                an->set_enabled (inst.plugin, (rounds / 5) % 2 == 0);
+            an->get_frame (inst.plugin, pre.data(), post.data(), 512);
+        }
         (void) inst.tail->get (inst.plugin);
         char text[64];
-        inst.params->value_to_text (inst.plugin, paramInfo (paramOutGain).id, 1.5, text, sizeof text);
+        inst.params->value_to_text (inst.plugin, inst.hostId (paramInfo (paramOutGain).id), 1.5, text, sizeof text);
         ++rounds;
         std::this_thread::yield();
     }
@@ -1214,7 +1447,9 @@ void testHostChecks (Ctx& c)
     check (c.host.violations.load() == 0, "no thread-check violations seen by the host",
            fmt ("%d violations (main checks %d, audio checks %d)", c.host.violations.load(), c.host.mainChecks.load(), c.host.audioChecks.load()));
     check (c.host.logErrors.load() == 0, "plugin logged no errors");
-    check (c.host.outEventsPushed.load() == 0, "plugin pushed no output events at all");
+    // JUCE wrapper: parameter changes made inside the plugin (state load) are reported to the host as output events
+    if (!c.options.juce)
+        check (c.host.outEventsPushed.load() == 0, "plugin pushed no output events at all");
     std::printf ("      info: thread-check calls from the plugin: main %d, audio %d (0 when the plugin is built without KICKEQ_THREAD_CHECKS)\n",
                  c.host.mainChecks.load(), c.host.audioChecks.load());
 }
@@ -1225,6 +1460,18 @@ int runConformance (Loader& loader, const Options& options)
     TestHost host;
     Ctx c { loader, host, loader.plugins(), options };
 
+    if (options.baselineOnly)
+    {
+        if (c.factory == nullptr)
+            return 1;
+        testBaseline (c);
+        if (!options.stateFile.empty())
+            testForeignState (c);
+        const Report& r = report();
+        std::printf ("\n%d checks passed, %d failed\n", r.passed, r.failed);
+        return r.failed == 0 && r.passed > 0 ? 0 : 1;
+    }
+
     testDescriptor (c);
     if (c.factory != nullptr)
     {
@@ -1233,13 +1480,17 @@ int runConformance (Loader& loader, const Options& options)
         testState (c);
         testLatencyTail (c);
         testPorts (c);
-        testRemoteControls (c);
-        testPresets (c);
+        if (!options.juce) // JUCE shell: no remote controls, preset discovery or analyser vendor extension
+        {
+            testRemoteControls (c);
+            testPresets (c);
+        }
         testProcessFlat (c);
         testProcessEvents (c);
         testProcessBlocks (c);
         testBaseline (c);
-        testAnalyzer (c);
+        if (!options.juce)
+            testAnalyzer (c);
         if (options.noThreads)
         {
             section ("concurrency: automation on the audio thread vs main thread access");

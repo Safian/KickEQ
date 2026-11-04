@@ -25,8 +25,15 @@
 //                                     44.1 kHz then at 48 kHz, interleaved little endian float32) for a later
 //                                     comparison with another shell
 //            --dump-state FILE        write the fixed baseline state blob
+//            --dump-saved FILE        write the state blob that the plugin itself saves after loading the baseline state
+//            --state-file FILE        (with --baseline-only) load a blob saved by another shell and verify that every
+//                                     parameter value survives bit-exactly
+//            --juce                   conformance profile for the JUCE shell's CLAP (JUCE wrapper behaviour, host ids are
+//                                     mapped by parameter name; see conformance.cpp for what differs and why)
+//            --baseline-only          run only the cross-shell baseline (needs --plugin; for --dump-output)
 //            --no-threads             skip the section that starts a second thread (qemu-user on some hosts crashes
 //                                     in pthread_create; the section is reported as SKIP)
+//   clap_testhost --compare A.f32 B.f32  compares two --dump-output files (bit-exact, else max abs difference < -120 dBFS)
 // Exit code 0 when every check passed.
 
 #include <cstdio>
@@ -54,9 +61,23 @@ int main (int argc, char** argv)
             options.dumpOutput = argv[++i];
         else if (arg ("--dump-state"))
             options.dumpState = argv[++i];
+        else if (arg ("--dump-saved"))
+            options.dumpSaved = argv[++i];
+        else if (arg ("--state-file"))
+            options.stateFile = argv[++i];
+        else if (std::strcmp (argv[i], "--juce") == 0)
+            options.juce = true;
+        else if (std::strcmp (argv[i], "--baseline-only") == 0)
+            options.baselineOnly = true;
+        else if (std::strcmp (argv[i], "--compare") == 0 && i + 2 < argc)
+            return th::compareDumps (argv[i + 1], argv[i + 2]);
         else
         {
-            std::fprintf (stderr, "usage: %s (--static | --plugin PATH.clap) [--no-threads] [--dump-output FILE.f32] [--dump-state FILE]\n", argv[0]);
+            std::fprintf (stderr,
+                          "usage: %s (--static | --plugin PATH.clap) [--juce] [--baseline-only] [--no-threads]\n"
+                          "          [--dump-output FILE.f32] [--dump-state FILE] [--dump-saved FILE] [--state-file FILE]\n"
+                          "       %s --compare A.f32 B.f32\n",
+                          argv[0], argv[0]);
             return 2;
         }
     }
@@ -66,6 +87,7 @@ int main (int argc, char** argv)
         return 2;
     }
 
+    th::setJuceProfile (options.juce);
     th::Loader loader;
     if (useStatic)
     {

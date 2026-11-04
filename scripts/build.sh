@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# KickEQ - build script for macOS and Linux (VST3 + CLAP)
+# KickEQ - build script for macOS and Linux (JUCE VST3 + CLAP, native CLAP, tools, tests)
 # Copyright (C) 2026 Safian Szabolcs
 # SPDX-License-Identifier: AGPL-3.0-or-later
 #
@@ -59,4 +59,4 @@ cmake --build "$build_dir" --config "$build_type" --parallel
 
 echo
 echo "Built:"
-find "$build_dir/KickEQ_artefacts/$build_type" -maxdepth 2 \( -name '*.vst3' -o -name '*.clap' \) -print
+find "$build_dir/KickEQ_artefacts/$build_type" "$build_dir/native" -maxdepth 2 \( -name '*.vst3' -o -name '*.clap' \) -print 2>/dev/null

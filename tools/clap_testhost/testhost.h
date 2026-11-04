@@ -28,6 +28,7 @@
 #include <cstdio>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <clap/clap.h>
@@ -131,6 +132,8 @@ struct Instance
     // main thread helpers
     double value (uint32_t id) const;
     std::array<double, kickeq::numParams> allValues() const;
+    /** Host-side id of a core parameter id (identity unless the JUCE profile is on: ids are hashes there). */
+    uint32_t hostId (uint32_t coreId) const;
     void setParams (const std::vector<ParamEvent>& events); // clap.params flush
     void setParam (uint32_t id, double v) { setParams ({ { 0, id, v } }); }
     std::vector<uint8_t> saveState (size_t maxChunk = 0, bool* okOut = nullptr) const;
@@ -157,6 +160,7 @@ struct Instance
     bool processing = false;
     uint32_t channels = 2;
     int64_t steady = 0;
+    std::vector<std::pair<uint32_t, uint32_t>> idMap; // core id -> host id (JUCE profile)
 };
 
 // ---------------------------------------------------------------------------------------------------------
@@ -188,7 +192,17 @@ std::vector<uint8_t> baselineState();
 struct Options
 {
     std::string dumpOutput, dumpState;
-    bool noThreads = false; // skip the multi-threaded section (for emulators without working threads)
+    std::string dumpSaved; // --dump-saved: the blob the plugin itself saves after loading the baseline state
+    std::string stateFile; // --state-file: a blob saved by another shell, loaded and checked (with --baseline-only)
+    bool noThreads = false;    // skip the multi-threaded section (for emulators without working threads)
+    bool juce = false;         // profile for the JUCE shell's CLAP (clap-juce-extensions wrapper), see conformance.cpp
+    bool baselineOnly = false; // only the cross-shell baseline (fixed state + 5 s noise), for --dump-output
 };
+
+/** Compares two --dump-output files (interleaved float32): bit-identical, or the largest absolute difference. */
+int compareDumps (const std::string& a, const std::string& b);
+
+/** Selects the JUCE profile before any Instance is created (host-side parameter ids are mapped by name). */
+void setJuceProfile (bool on);
 int runConformance (Loader& loader, const Options& options);
 } // namespace th
