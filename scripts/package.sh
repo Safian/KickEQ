@@ -9,6 +9,7 @@
 # macos-universal, windows-x64). Creates <out-dir>/KickEQ-<platform>.tar.gz containing
 #   native/KickEQ-native.clap   (always: the headless CLAP shell)
 #   VST3/KickEQ.vst3, CLAP/KickEQ.clap   (only when the JUCE desktop build exists in <build-dir>)
+#   tools/kickeq_bench, tools/clap_testhost   (when built)
 #   kickeq.manifest.json, LICENSE, NOTICE, THIRD_PARTY.md
 
 set -euo pipefail
@@ -34,6 +35,15 @@ if [[ -d "$juce/VST3" ]]; then
     cp -R "$juce/VST3/KickEQ.vst3" "$root/VST3/"
     cp -R "$juce/CLAP/KickEQ.clap" "$root/CLAP/"
 fi
+
+# benchmark and conformance tools (used for the MPC hardware measurement, see docs/MPC-BENCH-REQUEST.md)
+for tool in kickeq_bench clap_testhost; do
+    t="$(find "$build/tools" -maxdepth 2 \( -name "$tool" -o -name "$tool.exe" \) -type f 2>/dev/null | head -n 1)"
+    if [[ -n "$t" ]]; then
+        mkdir -p "$root/tools"
+        cp "$t" "$root/tools/"
+    fi
+done
 
 manifest="$(find "$build" -maxdepth 3 -name 'kickeq.manifest.json' | head -n 1)"
 [[ -n "$manifest" ]] && cp "$manifest" "$root/"

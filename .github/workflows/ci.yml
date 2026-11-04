@@ -210,7 +210,8 @@ jobs:
           if [ "$RUNNER_OS" = "Linux" ]; then
             xvfb-run -a "$tools/$exe" --strictness-level 5 --validate "$vst3"
           else
-            "$tools/$exe" --strictness-level 5 --validate "$vst3"
+            # --timeout-ms: the Windows runners are slow at opening the first editor (fonts, GDI), the default is 30 s
+            "$tools/$exe" --strictness-level 5 --timeout-ms 180000 --validate "$vst3"
           fi
 
       - name: Cache clap-validator

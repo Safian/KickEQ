@@ -258,4 +258,8 @@ void KickEQProcessor::setStateInformation (const void* data, int sizeInBytes)
     setEditorSettingsInternal (kickeq::ui::EditorSettings::fromChunk (ui.data, ui.size));
     for (int i = 0; i < kickeq::numParams; ++i)
         parameters[static_cast<size_t> (i)]->setPlainNotifyingHost (values.get (i)); // exact plain value, host + UI notified
+
+    // A state load changes every parameter value: CLAP requires a params rescan for that (clap-validator
+    // state-reproducibility tests); the clap-juce wrapper turns parameterInfoChanged into VALUES|TEXT|INFO.
+    updateHostDisplay (ChangeDetails().withParameterInfoChanged (true));
 }
