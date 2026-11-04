@@ -24,6 +24,8 @@ set(CMAKE_OSX_DEPLOYMENT_TARGET "11.0" CACHE STRING "Minimum macOS deployment ta
 # Build configuration. KICKEQ_BUILD_JUCE=OFF needs nothing but CMake and a C++17 compiler (the cross builds
 # and the portable core CI jobs use it); the JUCE/clap-juce-extensions dependencies are then never fetched.
 option(KICKEQ_BUILD_JUCE  "Build the JUCE plugin shell (VST3 + CLAP)" ON)
+option(KICKEQ_BUILD_CLAP_NATIVE "Build the native CLAP shell (static library kickeq_clap_native + KickEQ-native.clap)" ON)
+option(KICKEQ_BUILD_TOOLS "Build the developer tools (clap_testhost conformance host, kickeq_bench) and register their tests" ON)
 option(KICKEQ_BUILD_TESTS "Build and register the kickeq_core unit tests" ON)
 option(KICKEQ_SANITIZE    "Build kickeq_core and its tests with AddressSanitizer + UndefinedBehaviorSanitizer" OFF)
 
@@ -49,6 +51,35 @@ if(KICKEQ_BUILD_TESTS)
 endif()
 
 add_subdirectory(core)
+
+# ---------------------------------------------------------------------------
+# Native CLAP shell (no GUI toolkit; depends on the CLAP headers and kickeq_core only)
+# ---------------------------------------------------------------------------
+
+if(KICKEQ_BUILD_CLAP_NATIVE)
+    add_subdirectory(clap)
+endif()
+
+if(KICKEQ_BUILD_TOOLS)
+    if(NOT KICKEQ_BUILD_CLAP_NATIVE)
+        message(STATUS "KickEQ: KICKEQ_BUILD_TOOLS needs KICKEQ_BUILD_CLAP_NATIVE, tools are skipped")
+    elseif(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+        message(STATUS "KickEQ: no tools on iOS (static library only)")
+    else()
+        add_subdirectory(tools)
+    endif()
+endif()
+
+# ---------------------------------------------------------------------------
+# Plugin manifest (ARCHITECTURE.md section 10); the release job fills in "builds"
+# ---------------------------------------------------------------------------
+
+set(KICKEQ_LICENSE_SPDX "AGPL-3.0-or-later")
+set(KICKEQ_MIN_HOST_VERSION "1.0.0")
+configure_file(manifest/kickeq.manifest.json.in "${CMAKE_BINARY_DIR}/manifest/kickeq.manifest.json" @ONLY)
+
+include(GNUInstallDirs)
+install(FILES "${CMAKE_BINARY_DIR}/manifest/kickeq.manifest.json" DESTINATION "${CMAKE_INSTALL_DATADIR}/kickeq")
 
 # ---------------------------------------------------------------------------
 # JUCE shell (VST3 + CLAP)

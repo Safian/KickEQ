@@ -1,0 +1,12 @@
+{
+  "id": "com.safian.kickeq",
+  "name": "KickEQ",
+  "version": "@PROJECT_VERSION@",
+  "kind": "effect",
+  "author": "Safian Szabolcs",
+  "license": "@KICKEQ_LICENSE_SPDX@",
+  "homepage": "https://github.com/Safian/KickEQ",
+  "min_host_version": "@KICKEQ_MIN_HOST_VERSION@",
+  "clap_features": ["audio-effect", "equalizer", "stereo"],
+  "builds": []
+}
