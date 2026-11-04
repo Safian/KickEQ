@@ -6,9 +6,13 @@ shells run the same portable DSP core, so they render bit-identical audio for th
 
 ![KickEQ editor](docs/img/editor-default.png)
 
-> Version 0.1.0. Verified so far: macOS arm64 build, all tests (`ctest`), pluginval strictness 5 on the VST3, the
-> conformance host on both CLAPs. **Not done:** any test inside a DAW, builds on Windows / Linux (the CI workflow
-> exists but has not run), ARMv7 / iOS / Android builds from this tree, clap-validator on the JUCE CLAP.
+> Version 0.2.0. CI (GitHub Actions, `.github/workflows/ci.yml`) builds and tests core + native CLAP on Linux x86_64
+> (also with ASan/UBSan) and AArch64, macOS arm64 and Windows x64; cross-builds ARMv7 hard-float (Akai MPC) and
+> AArch64 and runs the tests under qemu-user; builds static libraries for iOS (device + simulator) and Android
+> (arm64-v8a, armeabi-v7a); builds the JUCE VST3 + CLAP on four desktop platforms and runs pluginval
+> (strictness 5; no Linux AArch64 pluginval asset exists, so not there) and clap-validator 0.4.1.
+> **Not done:** any test inside a DAW, mouse interaction of the editor on real hardware, CPU measurement on the MPC
+> ([docs/MPC-BENCH-REQUEST.md](docs/MPC-BENCH-REQUEST.md)), linear phase on the ARMv7 build (off by default there).
 
 ## Features
 
