@@ -1,0 +1,262 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 Safian Szabolcs
+#
+# CI for KickEQ (see docs/ARCHITECTURE.md section 11.3):
+#   core         core + native CLAP shell + tests on Linux x86_64 / AArch64, macOS, Windows (+ sanitizers)
+#   armv7        cross build for the Akai MPC (Linux ARMv7 hard-float, NEON), tests run under qemu-user
+#   plugins      desktop VST3 + CLAP (JUCE), pluginval, clap-validator
+#   ios/android  static-library build checks
+#   release      on tags v*: packages, SHA-256, manifest, GitHub release
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PLUGIN: KickEQ
+  PLUGINVAL_VERSION: v1.0.4
+  CLAP_VALIDATOR_VERSION: 0.4.1
+
+# actions are pinned by commit SHA:
+#   checkout v7.0.1 3d3c42e5aac5ba805825da76410c181273ba90b1, upload-artifact v7.0.2 cf430e030ddbb5b0abf93d22962f4752f3646cd9,
+#   download-artifact v8.0.2 9000827ccba6bdab643e8b6fd33ac0654aef8333, cache v6.1.0 55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+
+jobs:
+  core:
+    name: core (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-x86_64,      os: ubuntu-latest,    sanitize: OFF, config: Release }
+          - { name: linux-x86_64-asan, os: ubuntu-latest,    sanitize: ON,  config: Debug }
+          - { name: linux-aarch64,     os: ubuntu-24.04-arm, sanitize: OFF, config: Release }
+          - { name: macos-arm64,       os: macos-latest,     sanitize: OFF, config: Release }
+          - { name: windows-x64,       os: windows-latest,   sanitize: OFF, config: Release }
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Install Ninja (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ninja-build
+      - name: Configure
+        run: |
+          args=(-S . -B build-core -DKICKEQ_BUILD_JUCE=OFF -DKICKEQ_SANITIZE=${{ matrix.sanitize }} -DCMAKE_BUILD_TYPE=${{ matrix.config }})
+          if [ "$RUNNER_OS" = "Linux" ]; then args+=(-G Ninja); fi
+          if [ "$RUNNER_OS" = "Windows" ]; then args+=(-A x64); fi
+          cmake "${args[@]}"
+      - name: Build
+        run: cmake --build build-core --config ${{ matrix.config }} --parallel
+      - name: Test
+        run: ctest --test-dir build-core -C ${{ matrix.config }} --output-on-failure
+
+  armv7:
+    name: armv7 (MPC, qemu-user)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Install cross toolchain and qemu
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ninja-build g++-arm-linux-gnueabihf qemu-user
+      - name: Configure and build (armv7-a, NEON VFPv4, hard-float)
+        run: |
+          cmake -S . -B build-armv7 -G Ninja -DCMAKE_BUILD_TYPE=Release -DKICKEQ_BUILD_JUCE=OFF \
+            -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/armv7-linux-gnueabihf.cmake
+          cmake --build build-armv7 --parallel
+          file build-armv7/native/KickEQ-native.clap
+      - name: Test under qemu-arm (core tests, conformance static + dynamic, bench regression guard)
+        run: ctest --test-dir build-armv7 --output-on-failure
+      - name: Package (MPC)
+        run: scripts/package.sh linux-armv7 build-armv7 dist
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: KickEQ-linux-armv7
+          path: dist/*
+          if-no-files-found: error
+
+  aarch64-cross:
+    name: aarch64 (cross build + qemu-user)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Install cross toolchain and qemu
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ninja-build g++-aarch64-linux-gnu qemu-user
+      - name: Configure, build, test
+        run: |
+          cmake -S . -B build-a64 -G Ninja -DCMAKE_BUILD_TYPE=Release -DKICKEQ_BUILD_JUCE=OFF \
+            -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/aarch64-linux-gnu.cmake
+          cmake --build build-a64 --parallel
+          ctest --test-dir build-a64 --output-on-failure
+
+  ios:
+    name: ios (static library)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Build core + native CLAP shell for device and simulator
+        run: |
+          for sdk in iphoneos iphonesimulator; do
+            cmake -S . -B build-ios-$sdk -G Xcode \
+              -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/ios.cmake -DKICKEQ_IOS_SDK=$sdk \
+              -DKICKEQ_BUILD_JUCE=OFF -DKICKEQ_BUILD_TESTS=OFF -DKICKEQ_BUILD_TOOLS=OFF
+            cmake --build build-ios-$sdk --config Release --parallel
+            find build-ios-$sdk -name 'libkickeq_clap_native.a' -exec lipo -info {} \;
+          done
+
+  android:
+    name: android (${{ matrix.abi }}, static library)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        abi: [arm64-v8a, armeabi-v7a]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Build with the NDK
+        run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends ninja-build
+          cmake -S . -B build-android -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/android.cmake -DANDROID_ABI=${{ matrix.abi }} \
+            -DKICKEQ_BUILD_JUCE=OFF -DKICKEQ_BUILD_TESTS=OFF -DKICKEQ_BUILD_TOOLS=OFF
+          cmake --build build-android --parallel
+          file build-android/clap/libkickeq_clap_native.a
+
+  plugins:
+    name: plugins (${{ matrix.platform }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest,    platform: linux-x86_64 }
+          - { os: ubuntu-24.04-arm, platform: linux-aarch64 }
+          - { os: macos-latest,     platform: macos-arm64 }
+          - { os: windows-latest,   platform: windows-x64 }
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ninja-build pkg-config xvfb \
+            libasound2-dev libx11-dev libxcomposite-dev libxcursor-dev libxext-dev \
+            libxinerama-dev libxrandr-dev libxrender-dev libfreetype-dev libfontconfig1-dev \
+            libgl1-mesa-dev
+
+      - name: Build (macOS / Linux)
+        if: runner.os != 'Windows'
+        run: scripts/build.sh
+
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          cmake -S . -B build -A x64
+          cmake --build build --config Release --parallel
+
+      - name: Tests
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: Package
+        run: scripts/package.sh "${{ matrix.platform }}" build dist
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: ${{ env.PLUGIN }}-${{ matrix.platform }}
+          path: dist/*
+          if-no-files-found: error
+
+      # pluginval is downloaded from the official Tracktion/pluginval release and verified
+      # against the SHA-256 recorded when this workflow was written (no Linux AArch64 asset exists).
+      - name: pluginval (VST3)
+        if: matrix.platform != 'linux-aarch64'
+        run: |
+          case "$RUNNER_OS" in
+            Linux)   asset=pluginval_Linux.zip;   sha=c01c49d8063965c4c2dea8324468336768f5c9139e0b1caebde14c2400b55352; exe=pluginval ;;
+            macOS)   asset=pluginval_macOS.zip;   sha=3c4c533bda0c5059eea3ddaea752d757ee2025041f0f47e6bcb0e87f6082b29f; exe=pluginval.app/Contents/MacOS/pluginval ;;
+            Windows) asset=pluginval_Windows.zip; sha=c08e61ce3b96db41636f8ec7e76f4c7e2c13ebdac7fa1b5a1f52b4f32ec715ab; exe=pluginval.exe ;;
+          esac
+          tools="$RUNNER_TEMP/pluginval"
+          mkdir -p "$tools"
+          curl -fsSL -o "$tools/$asset" "https://github.com/Tracktion/pluginval/releases/download/${PLUGINVAL_VERSION}/${asset}"
+          if command -v sha256sum >/dev/null; then actual=$(sha256sum "$tools/$asset" | cut -d' ' -f1); else actual=$(shasum -a 256 "$tools/$asset" | cut -d' ' -f1); fi
+          [ "$actual" = "$sha" ] || { echo "SHA-256 mismatch for $asset: $actual"; exit 1; }
+          (cd "$tools" && cmake -E tar xf "$asset")
+          chmod +x "$tools/$exe" || true
+          vst3="build/${PLUGIN}_artefacts/Release/VST3/${PLUGIN}.vst3"
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            xvfb-run -a "$tools/$exe" --strictness-level 5 --validate "$vst3"
+          else
+            "$tools/$exe" --strictness-level 5 --validate "$vst3"
+          fi
+
+      - name: Cache clap-validator
+        id: cv-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ~/.cargo-cv
+          key: clap-validator-${{ env.CLAP_VALIDATOR_VERSION }}-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Build clap-validator
+        if: steps.cv-cache.outputs.cache-hit != 'true'
+        run: |
+          cargo install --locked --root "$HOME/.cargo-cv" --git https://github.com/free-audio/clap-validator \
+            --tag "${CLAP_VALIDATOR_VERSION}" clap-validator
+
+      # clap-validator 0.4.1 deadlocks in its two preset-discovery tests (metadata_receiver.rs: begin_preset
+      # holds the `result` lock while calling flush_preset), so those two are excluded; everything else runs.
+      - name: clap-validator (JUCE CLAP and native CLAP)
+        run: |
+          export PATH="$HOME/.cargo-cv/bin:$PATH"
+          juce_clap="build/${PLUGIN}_artefacts/Release/CLAP/${PLUGIN}.clap"
+          native_clap="$(find build -name 'KickEQ-native.clap' -maxdepth 4 | head -n 1)"
+          run() { if [ "$RUNNER_OS" = "Linux" ]; then xvfb-run -a "$@"; else "$@"; fi; }
+          run clap-validator validate --test-filter 'preset-discovery' --invert-filter "$juce_clap"
+          run clap-validator validate --test-filter 'preset-discovery' --invert-filter "$native_clap"
+
+  release:
+    name: release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [core, armv7, aarch64-cross, ios, android, plugins]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          path: dist
+          pattern: KickEQ-*
+          merge-multiple: true
+      - name: Manifest and checksums
+        run: |
+          python3 scripts/make_manifest.py --version "${GITHUB_REF_NAME#v}" --repo "${GITHUB_REPOSITORY}" \
+            --tag "${GITHUB_REF_NAME}" --dist dist --template manifest/kickeq.manifest.json.in --out dist/kickeq.manifest.json
+          (cd dist && sha256sum * > SHA256SUMS)
+          ls -l dist
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${GITHUB_REF_NAME}" dist/* --title "KickEQ ${GITHUB_REF_NAME}" --generate-notes
