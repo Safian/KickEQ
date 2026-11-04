@@ -233,8 +233,8 @@ jobs:
           juce_clap="build/${PLUGIN}_artefacts/Release/CLAP/${PLUGIN}.clap"
           native_clap="$(find build -name 'KickEQ-native.clap' -maxdepth 4 | head -n 1)"
           run() { if [ "$RUNNER_OS" = "Linux" ]; then xvfb-run -a "$@"; else "$@"; fi; }
-          run clap-validator validate --test-filter 'preset-discovery' --invert-filter "$juce_clap"
-          run clap-validator validate --test-filter 'preset-discovery' --invert-filter "$native_clap"
+          run clap-validator validate --exclude 'preset-discovery' "$juce_clap"
+          run clap-validator validate --exclude 'preset-discovery' "$native_clap"
 
   release:
     name: release

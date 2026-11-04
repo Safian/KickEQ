@@ -27,7 +27,6 @@ using namespace tu;
 
 namespace
 {
-double lastSample (const std::vector<float>& v) { return v.back(); }
 
 /** Channel-view measurement through the engine, see ChannelView. */
 double measureView (const ParamValues& pv, double fs, double freq, ChannelView view)
@@ -275,7 +274,6 @@ TEST (stereo_side_only_band_leaves_a_mono_signal_untouched_and_mid_leaves_side_u
         CHECK_NEAR (l[static_cast<size_t> (i)], mono[static_cast<size_t> (i)], 1.0e-7);
         CHECK_NEAR (r[static_cast<size_t> (i)], -mono[static_cast<size_t> (i)], 1.0e-7);
     }
-    (void) lastSample;
 }
 
 TEST (stereo_left_and_right_bands_are_independent)

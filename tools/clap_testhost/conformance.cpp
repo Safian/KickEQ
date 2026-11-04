@@ -380,8 +380,8 @@ void testParams (Ctx& c)
                                    [] (const clap_input_events_t* l, uint32_t) -> const clap_event_header_t* {
                                        return static_cast<const L*> (l->ctx)->h;
                                    } };
-        clap_output_events_t out = { nullptr, [] (const clap_output_events_t*, const clap_event_header_t*) -> bool { return true; } };
-        pe->flush (p, &in, &out);
+        clap_output_events_t sink = { nullptr, [] (const clap_output_events_t*, const clap_event_header_t*) -> bool { return true; } };
+        pe->flush (p, &in, &sink);
         check (inst.value (paramInfo (paramOutGain).id) == 0.0, "flush: events of a foreign event space are ignored");
     }
 
