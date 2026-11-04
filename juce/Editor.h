@@ -52,6 +52,10 @@ public:
         the snapshot tool to render the interactive state). */
     void previewBand (int band, kickeq::ChannelView view);
 
+    /** The canvas and the band strip (for tests that drive the editor with synthetic mouse events). */
+    kickeq::ui::EqCanvas& getCanvas() noexcept { return canvas; }
+    kickeq::ui::BandPanel& getBandPanel() noexcept { return bandPanel; }
+
 private:
     void timerCallback() override { refreshFrame(); }
     void settingsFromControls();

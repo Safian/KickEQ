@@ -43,6 +43,10 @@ public:
     /** Greys out controls that have no effect for the band's type and repaints the chips. */
     void updateState();
 
+    /** The control attached to a parameter of the selected band (on: ToggleButton, type / slope / place: ComboBox,
+        freq / gain / q: Slider). */
+    juce::Component& getControl (kickeq::BandParam k) noexcept;
+
     std::function<void (int)> onBandChosen;
 
     void paint (juce::Graphics&) override;

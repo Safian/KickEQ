@@ -263,6 +263,19 @@ if(KICKEQ_BUILD_JUCE)
                 juce::juce_recommended_config_flags
                 juce::juce_recommended_warning_flags)
         add_test(NAME kickeq_juce_shell_test COMMAND ${KICKEQ_GUI_TEST_RUNNER} $<TARGET_FILE:kickeq_juce_shell_test>)
+
+        # Mouse and keyboard interaction of the editor canvas, driven with synthetic events (no window, no display
+        # needed on macOS / Windows; xvfb-run on Linux like the other JUCE tests)
+        juce_add_console_app(kickeq_editor_interaction_test PRODUCT_NAME "kickeq_editor_interaction_test")
+        target_sources(kickeq_editor_interaction_test PRIVATE tools/editor_interaction_test/main.cpp)
+        target_compile_definitions(kickeq_editor_interaction_test PRIVATE JUCE_USE_CURL=0 JUCE_WEB_BROWSER=0)
+        target_link_libraries(kickeq_editor_interaction_test
+            PRIVATE
+                kickeq_juce_shell
+                juce::juce_recommended_config_flags
+                juce::juce_recommended_warning_flags)
+        add_test(NAME kickeq_editor_interaction_test COMMAND ${KICKEQ_GUI_TEST_RUNNER} $<TARGET_FILE:kickeq_editor_interaction_test>)
+        set_tests_properties(kickeq_editor_interaction_test PROPERTIES TIMEOUT 120)
     endif()
 
     # ---------------------------------------------------------------------------

@@ -65,6 +65,25 @@ public:
         hoverBand = band;
         repaint();
     }
+    int getHoverBand() const noexcept { return hoverBand; }
+    /** Band whose node is being dragged (-1: none). */
+    int getDragBand() const noexcept { return dragBand; }
+
+    /** The plot rectangle (canvas coordinates) and the centre of a band's node; the node is drawn, and hit, here. */
+    juce::Rectangle<float> getPlotBounds() const noexcept { return plot; }
+    juce::Point<float> getNodeCentre (int band) const noexcept { return nodePosition (band); }
+
+    // ---- right-click menu ------------------------------------------------------------------------------------------
+    // Item ids: 1 = disable the band, 100 + i = type i, 200 + i = slope index i, 300 + i = placement i; 0 = dismissed.
+    static constexpr int menuDisableBand = 1, menuTypeBase = 100, menuSlopeBase = 200, menuPlacementBase = 300;
+
+    /** The menu of a band (type / slope / placement submenus with the current choice ticked, "Disable band"). */
+    juce::PopupMenu buildBandMenu (int band) const;
+    /** Applies an id returned by the menu to a band's parameters (one complete automation gesture). */
+    void applyMenuChoice (int band, int result);
+    /** Shows a band menu and reports the chosen id (0 = dismissed). Empty: the default, an asynchronous popup menu
+        at the mouse position. Tests set it to present the menu without a window. */
+    std::function<void (juce::PopupMenu, std::function<void (int)>)> menuPresenter;
 
     void paint (juce::Graphics&) override;
     void resized() override;

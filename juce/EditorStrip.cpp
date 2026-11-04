@@ -194,6 +194,22 @@ void BandPanel::updateState()
     qSlider.setEnabled (qMatters);
 }
 
+juce::Component& BandPanel::getControl (kickeq::BandParam k) noexcept
+{
+    using K = kickeq::BandParam;
+    switch (k)
+    {
+        case K::on:    return onButton;
+        case K::type:  return typeBox;
+        case K::freq:  return freqSlider;
+        case K::gain:  return gainSlider;
+        case K::q:     return qSlider;
+        case K::place: return placeBox;
+        case K::slope: return slopeBox;
+    }
+    return onButton;
+}
+
 void BandPanel::paint (juce::Graphics& g)
 {
     g.setColour (colours::panel);

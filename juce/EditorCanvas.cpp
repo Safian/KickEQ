@@ -75,7 +75,10 @@ EqCanvas::EqCanvas (KickEQProcessor& p) : processor (p)
     setSettings (s);
 }
 
-EqCanvas::~EqCanvas() = default;
+EqCanvas::~EqCanvas()
+{
+    endDrag(); // never leave an open change gesture behind (the editor can be closed while the mouse is held)
+}
 
 // ---- geometry -------------------------------------------------------------------------------------------------
 
@@ -587,7 +590,12 @@ void EqCanvas::beginDrag (int band, const juce::MouseEvent& e)
     dragMode = e.mods.isShiftDown() ? DragMode::q : DragMode::move;
     dragHasGain = typeHasGain (p.type);
     dragStartQ = p.q;
-    grabOffset = e.position - nodePosition (band);
+    // relative to the unclamped position: a gain beyond the curve range is drawn on the plot edge, but grabbing the node
+    // must not make the value jump to the edge
+    juce::Point<float> node = nodePosition (band);
+    if (dragHasGain)
+        node.y = curveDbToY (p.gainDb);
+    grabOffset = e.position - node;
 
     if (dragMode == DragMode::move)
     {
@@ -646,7 +654,7 @@ void EqCanvas::disableBand (int band)
     repaint();
 }
 
-void EqCanvas::showBandMenu (int band)
+juce::PopupMenu EqCanvas::buildBandMenu (int band) const
 {
     const kickeq::BandParams p = values.band (band);
     juce::PopupMenu menu;
@@ -654,32 +662,50 @@ void EqCanvas::showBandMenu (int band)
 
     juce::PopupMenu types, slopes, places;
     for (int i = 0; i < kickeq::numBandTypes; ++i)
-        types.addItem (100 + i, kickeq::bandTypeLabels[i], true, static_cast<int> (p.type) == i);
+        types.addItem (menuTypeBase + i, kickeq::bandTypeLabels[i], true, static_cast<int> (p.type) == i);
     for (int i = 0; i < kickeq::numSlopes; ++i)
-        slopes.addItem (200 + i, kickeq::slopeLabels[i], true, p.slopeIndex == i);
+        slopes.addItem (menuSlopeBase + i, kickeq::slopeLabels[i], true, p.slopeIndex == i);
     for (int i = 0; i < kickeq::numPlacements; ++i)
-        places.addItem (300 + i, kickeq::placementLabels[i], true, static_cast<int> (p.place) == i);
+        places.addItem (menuPlacementBase + i, kickeq::placementLabels[i], true, static_cast<int> (p.place) == i);
 
     menu.addSubMenu ("Type", types);
     menu.addSubMenu ("Slope", slopes, typeIsCut (p.type));
     menu.addSubMenu ("Placement", places);
     menu.addSeparator();
-    menu.addItem (1, "Disable band");
+    menu.addItem (menuDisableBand, "Disable band");
+    return menu;
+}
 
+void EqCanvas::applyMenuChoice (int band, int result)
+{
+    if (result == 0)
+        return;
+    if (result == menuDisableBand)
+        disableBand (band);
+    else if (result >= menuTypeBase && result < menuSlopeBase)
+        attachment (band, kickeq::BandParam::type).setValueAsCompleteGesture (static_cast<float> (result - menuTypeBase));
+    else if (result >= menuSlopeBase && result < menuPlacementBase)
+        attachment (band, kickeq::BandParam::slope).setValueAsCompleteGesture (static_cast<float> (result - menuSlopeBase));
+    else if (result >= menuPlacementBase)
+        attachment (band, kickeq::BandParam::place).setValueAsCompleteGesture (static_cast<float> (result - menuPlacementBase));
+}
+
+void EqCanvas::showBandMenu (int band)
+{
+    juce::PopupMenu menu = buildBandMenu (band);
     juce::Component::SafePointer<EqCanvas> safe (this);
+    std::function<void (int)> done = [safe, band] (int result) {
+        if (safe != nullptr)
+            safe->applyMenuChoice (band, result);
+    };
+
+    if (menuPresenter)
+    {
+        menuPresenter (std::move (menu), std::move (done));
+        return;
+    }
     menu.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (this).withMousePosition().withMinimumWidth (140),
-                        [safe, band] (int result) {
-                            if (safe == nullptr || result == 0)
-                                return;
-                            if (result == 1)
-                                safe->disableBand (band);
-                            else if (result >= 100 && result < 200)
-                                safe->attachment (band, kickeq::BandParam::type).setValueAsCompleteGesture (static_cast<float> (result - 100));
-                            else if (result >= 200 && result < 300)
-                                safe->attachment (band, kickeq::BandParam::slope).setValueAsCompleteGesture (static_cast<float> (result - 200));
-                            else if (result >= 300)
-                                safe->attachment (band, kickeq::BandParam::place).setValueAsCompleteGesture (static_cast<float> (result - 300));
-                        });
+                        std::move (done));
 }
 
 // ---- mouse and keyboard ---------------------------------------------------------------------------------------
@@ -706,6 +732,7 @@ void EqCanvas::mouseExit (const juce::MouseEvent&)
 void EqCanvas::mouseDown (const juce::MouseEvent& e)
 {
     grabKeyboardFocus();
+    endDrag(); // a second press while a drag is running (another button, a lost mouse-up): close the first gesture
     const int hit = bandAt (e.position);
     if (hit < 0)
         return;
