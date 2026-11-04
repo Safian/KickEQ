@@ -201,7 +201,8 @@ jobs:
           tools="$RUNNER_TEMP/pluginval"
           mkdir -p "$tools"
           curl -fsSL -o "$tools/$asset" "https://github.com/Tracktion/pluginval/releases/download/${PLUGINVAL_VERSION}/${asset}"
-          if command -v sha256sum >/dev/null; then actual=$(sha256sum "$tools/$asset" | cut -d' ' -f1); else actual=$(shasum -a 256 "$tools/$asset" | cut -d' ' -f1); fi
+          # run in the directory: sha256sum prefixes the hash with a backslash when the path contains one (Windows)
+          if command -v sha256sum >/dev/null; then actual=$(cd "$tools" && sha256sum "$asset" | cut -d' ' -f1); else actual=$(cd "$tools" && shasum -a 256 "$asset" | cut -d' ' -f1); fi
           [ "$actual" = "$sha" ] || { echo "SHA-256 mismatch for $asset: $actual"; exit 1; }
           (cd "$tools" && cmake -E tar xf "$asset")
           chmod +x "$tools/$exe" || true
