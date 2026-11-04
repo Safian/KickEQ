@@ -29,7 +29,7 @@ option(KICKEQ_BUILD_TOOLS "Build the developer tools (clap_testhost conformance 
 option(KICKEQ_BUILD_TESTS "Build and register the kickeq_core unit tests" ON)
 option(KICKEQ_SANITIZE    "Build kickeq_core and its tests with AddressSanitizer + UndefinedBehaviorSanitizer" OFF)
 
-project(KickEQ VERSION 0.1.0 LANGUAGES CXX)
+project(KickEQ VERSION 0.2.0 LANGUAGES CXX)
 
 # Linear-phase mode (ARCHITECTURE.md section 4.7): partitioned FFT convolution + kernel design thread. When OFF the code is
 # not compiled into the engine, phase_mode stays in the parameter table but is reported hidden + read-only and forced

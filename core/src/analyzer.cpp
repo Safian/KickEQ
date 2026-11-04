@@ -204,13 +204,28 @@ void SpectrumAnalyzer::process() noexcept
     const bool enabled = enabledFlag.load (std::memory_order_acquire);
     bool produced = false;
 
-    for (;;)
+    // The work of one call is bounded by what is pending *now*: a producer faster than real time (offline
+    // bounce, a validator) must not keep this loop, which runs on the UI thread, from ever finishing. Only the
+    // newest fftSize + hopSize samples are kept (one fresh analysis window plus one hop), older ones are dropped:
+    // the display always shows the present, never a backlog.
+    size_t budget = std::min (pre.ring.readAvailable(), post.ring.readAvailable());
+    const size_t maxBacklog = static_cast<size_t> (fftSize) + static_cast<size_t> (hopSize);
+    while (budget > maxBacklog)
     {
-        const size_t avail = std::min (pre.ring.readAvailable(), post.ring.readAvailable());
+        const size_t drop = std::min (budget - maxBacklog, static_cast<size_t> (hopSize));
+        pre.ring.read (chunkPre.data(), drop);
+        post.ring.read (chunkPost.data(), drop);
+        budget -= drop;
+    }
+
+    while (budget > 0)
+    {
+        const size_t avail = std::min (std::min (pre.ring.readAvailable(), post.ring.readAvailable()), budget);
         if (avail == 0)
             break;
 
         const size_t take = std::min (avail, static_cast<size_t> (hopSize - sinceHop));
+        budget -= take;
         pre.ring.read (chunkPre.data(), take);
         post.ring.read (chunkPost.data(), take);
 

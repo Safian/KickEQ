@@ -20,6 +20,7 @@
 // Spectrum analyser: SPSC ring stress, peak position / level, enable / source handling, frame hand-off.
 
 #include <atomic>
+#include <chrono>
 #include <thread>
 
 #include "kickeq/analyzer.h"
@@ -376,4 +377,54 @@ TEST (analyzer_producer_and_ui_thread_split)
     analyser.join();
     ui.join();
     CHECK (processed.load() > 0);
+}
+
+// Regression: a producer faster than real time (offline bounce, pluginval) used to keep process(), which runs on
+// the UI thread, in its drain loop for as long as the producer kept going - the editor then starved the message
+// thread ("Open editor whilst processing" timed out). One call must do bounded work.
+TEST (analyzer_process_is_bounded_while_a_producer_runs_flat_out)
+{
+    SpectrumAnalyzer a;
+    a.setEnabled (true);
+
+    std::atomic<bool> run { true };
+    std::atomic<int> pushed { 0 };
+    std::thread producer ([&] {
+        std::vector<float> x (256, 0.25f);
+        while (run.load())
+        {
+            a.push (x.data(), x.data(), x.data(), x.data(), 256);
+            pushed.fetch_add (1);
+        }
+    });
+    while (pushed.load() < 64) // make sure the producer is really running before the consumer starts
+        std::this_thread::yield();
+
+    int calls = 0;
+    SpectrumFrame frame;
+    const auto start = std::chrono::steady_clock::now();
+    while (calls < 200)
+    {
+        a.process(); // would never return with an unbounded drain loop
+        ++calls;
+    }
+    const double ms = std::chrono::duration<double, std::milli> (std::chrono::steady_clock::now() - start).count();
+    run.store (false);
+    producer.join();
+
+    a.process();
+    CHECK (a.pull (frame));
+    CHECK (calls == 200);
+    CHECK (ms < 4000.0); // 200 calls of at most ~5 hops (10 FFTs): far below this on any machine
+
+    // a 64k backlog is reduced to the newest window: at most fftSize + hop samples are analysed in one call
+    a.process(); // drain
+    (void) a.pull (frame); // frame.sequence is now the latest published sequence
+    std::vector<float> x (4096, 0.25f);
+    for (int i = 0; i < 15; ++i)
+        a.push (x.data(), x.data(), x.data(), x.data(), 4096);
+    a.process();
+    SpectrumFrame after;
+    CHECK (a.pull (after));
+    CHECK (after.sequence - frame.sequence == 1); // one publish per call, however large the backlog
 }
