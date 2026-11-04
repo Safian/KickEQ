@@ -1,0 +1,106 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 Safian Szabolcs
+#
+# Builds VST3 + CLAP on Linux, macOS and Windows, uploads the plugins as artifacts and runs
+# pluginval (VST3) and clap-validator (CLAP).
+#
+# NOTE: this workflow was only syntax-checked locally; it has not been executed on GitHub yet
+# (only the macOS arm64 steps were reproduced by hand, see README.md).
+
+name: build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PLUGIN: KickEQ
+  PLUGINVAL_VERSION: v1.0.4
+  CLAP_VALIDATOR_VERSION: 0.4.1
+
+jobs:
+  build:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      # actions are pinned by commit SHA (checkout v7.0.1, upload-artifact v7.0.2)
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ninja-build pkg-config xvfb \
+            libasound2-dev libx11-dev libxcomposite-dev libxcursor-dev libxext-dev \
+            libxinerama-dev libxrandr-dev libxrender-dev libfreetype-dev libfontconfig1-dev \
+            libgl1-mesa-dev
+
+      - name: Build (macOS / Linux)
+        if: runner.os != 'Windows'
+        run: scripts/build.sh
+
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          cmake -S . -B build -A x64
+          cmake --build build --config Release --parallel
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          tar -C "build/${PLUGIN}_artefacts/Release" -czf "dist/${PLUGIN}-${RUNNER_OS}.tar.gz" VST3 CLAP
+          ls -l dist
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: ${{ env.PLUGIN }}-${{ runner.os }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+      # pluginval is downloaded from the official Tracktion/pluginval release and verified
+      # against the SHA-256 recorded when this workflow was written.
+      - name: pluginval (VST3)
+        run: |
+          case "$RUNNER_OS" in
+            Linux)   asset=pluginval_Linux.zip;   sha=c01c49d8063965c4c2dea8324468336768f5c9139e0b1caebde14c2400b55352; exe=pluginval ;;
+            macOS)   asset=pluginval_macOS.zip;   sha=3c4c533bda0c5059eea3ddaea752d757ee2025041f0f47e6bcb0e87f6082b29f; exe=pluginval.app/Contents/MacOS/pluginval ;;
+            Windows) asset=pluginval_Windows.zip; sha=c08e61ce3b96db41636f8ec7e76f4c7e2c13ebdac7fa1b5a1f52b4f32ec715ab; exe=pluginval.exe ;;
+          esac
+          tools="$RUNNER_TEMP/pluginval"
+          mkdir -p "$tools"
+          curl -fsSL -o "$tools/$asset" "https://github.com/Tracktion/pluginval/releases/download/${PLUGINVAL_VERSION}/${asset}"
+          if command -v sha256sum >/dev/null; then actual=$(sha256sum "$tools/$asset" | cut -d' ' -f1); else actual=$(shasum -a 256 "$tools/$asset" | cut -d' ' -f1); fi
+          [ "$actual" = "$sha" ] || { echo "SHA-256 mismatch for $asset: $actual"; exit 1; }
+          (cd "$tools" && cmake -E tar xf "$asset")
+          chmod +x "$tools/$exe" || true
+          vst3="build/${PLUGIN}_artefacts/Release/VST3/${PLUGIN}.vst3"
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            xvfb-run -a "$tools/$exe" --strictness-level 5 --validate "$vst3"
+          else
+            "$tools/$exe" --strictness-level 5 --validate "$vst3"
+          fi
+
+      # clap-validator is built from source (tagged release) with cargo; not verified locally,
+      # so a failure here does not fail the job yet.
+      - name: clap-validator (CLAP)
+        continue-on-error: true
+        run: |
+          cargo install --locked --git https://github.com/free-audio/clap-validator --tag "${CLAP_VALIDATOR_VERSION}" clap-validator
+          clap-validator validate "build/${PLUGIN}_artefacts/Release/CLAP/${PLUGIN}.clap"

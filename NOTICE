@@ -1,0 +1,20 @@
+KickEQ
+Copyright (C) 2026 Safian Szabolcs
+
+This product is licensed under the GNU Affero General Public License, version 3 or (at your
+option) any later version (SPDX: AGPL-3.0-or-later). The full text is in the file LICENSE.
+
+This product includes software developed by third parties:
+
+  * JUCE (https://juce.com), used under the terms of the GNU Affero General Public License v3
+    (JUCE 8.0.17-security).
+  * clap-juce-extensions (https://github.com/free-audio/clap-juce-extensions), MIT licence,
+    Copyright 2019-2020 Paul Walker and contributors (commit 7adee3a1bd4684d4caa5601100e364abccff4b4d).
+  * CLAP (https://github.com/free-audio/clap) and clap-helpers (https://github.com/free-audio/clap-helpers),
+    MIT licence, Copyright (c) 2021 Alexandre BIQUE.
+  * Steinberg VST 3 SDK 3.8.0 (bundled with JUCE), MIT licence, Copyright (c) 2025 Steinberg Media
+    Technologies GmbH.
+
+Exact versions and licence details: THIRD_PARTY.md.
+
+VST is a registered trademark of Steinberg Media Technologies GmbH.

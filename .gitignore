@@ -1,0 +1,15 @@
+# Build output and IDE files
+build/
+build-*/
+cmake-build-*/
+out/
+dist/
+.vs/
+.vscode/
+.idea/
+.cache/
+*.xcodeproj
+.DS_Store
+*.swp
+compile_commands.json
+CMakeUserPresets.json
