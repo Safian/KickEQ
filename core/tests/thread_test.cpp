@@ -156,7 +156,7 @@ void linkStress()
     stop.store (true);
     producer.join();
 
-    check (reads > 1000, "link: snapshots were read");
+    check (reads > 100, "link: snapshots were read"); // liveness only: ASan on a loaded runner managed 462 in 800 ms
     check (consistent, "link: snapshots are consistent");
     check (monotone, "link: sequence never goes back");
     std::printf ("link: %llu snapshots read, %llu requests posted\n", static_cast<unsigned long long> (reads),
