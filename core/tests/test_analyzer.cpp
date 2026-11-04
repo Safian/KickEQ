@@ -373,6 +373,8 @@ TEST (analyzer_producer_and_ui_thread_split)
         if ((i & 15) == 0)
             std::this_thread::yield();
     }
+    while (processed.load() == 0) // the analyser thread may not have been scheduled yet (seen on Windows runners)
+        std::this_thread::yield();
     stop.store(true);
     analyser.join();
     ui.join();
